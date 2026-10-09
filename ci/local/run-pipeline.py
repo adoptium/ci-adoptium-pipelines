@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 ################################################################################
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,6 +34,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# Add scripts/lib to the path so that shared utilities (load_stage_constants.py,
+# collect-stage-params.py, etc.) are importable by ci/local/lib modules.
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts" / "lib"))
+
 from lib.cli_parser import PipelineArgParser
 from lib.stage_executor import StageExecutor
 from lib.stage_params import collect_stage_params, parse_extra_args
@@ -43,22 +48,23 @@ from lib.workspace_manager import WorkspaceManager
 # ---------------------------------------------------------------------------
 # Stage ID constants — match the "id" fields in pipeline-stages.json exactly.
 # ---------------------------------------------------------------------------
-INITIALIZE = "01-initialize"
-BUILD = "02-build"
-INTERNAL_CODE_SIGN = "03-internal-code-sign"
-ASSEMBLE_IMAGES = "04-assemble-images"
-POST_BUILD_CODE_SIGN = "06-post-build-code-sign"
-BUILD_INSTALLERS = "07-installer"
-CODE_SIGN_INSTALLER = "08-code-sign-installer"
-SBOM_SIGN = "09-sbom-sign"
-DIGITAL_ARTIFACT_SIGN = "10-digital-artifact-sign"
-VERIFY_SIGNING = "11-verify-signing"
-VALIDATE_SBOM = "12-validate-sbom"
-SMOKE_TESTS = "13-smoke-tests"
-AQA_TESTS = "14-aqa-tests"
-TCK_TESTS = "15-tck-tests"
-PUBLISH_ARTIFACTS = "16-publish"
-REPRODUCIBLE_COMPARE = "20-reproducible-compare"
+INITIALIZE = "010-initialize"
+BUILD = "020-build"
+INTERNAL_CODE_SIGN = "030-internal-code-sign"
+ASSEMBLE_IMAGES = "040-assemble-images"
+POST_BUILD_CODE_SIGN = "060-post-build-code-sign"
+BUILD_INSTALLERS = "070-installer"
+CODE_SIGN_INSTALLER = "080-code-sign-installer"
+SBOM_SIGN = "090-sbom-sign"
+DIGITAL_ARTIFACT_SIGN = "100-digital-artifact-sign"
+VERIFY_SIGNING = "110-verify-signing"
+VALIDATE_SBOM = "120-validate-sbom"
+SMOKE_TESTS = "130-smoke-tests"
+AQA_TESTS = "140-aqa-tests"
+TCK_TESTS = "150-tck-tests"
+CREATE_API_METADATA = "180-create-api-metadata"
+PUBLISH_ARTIFACTS = "190-publish"
+REPRODUCIBLE_COMPARE = "200-reproducible-compare"
 
 # Ordered list of stageIds that the local runner executes (subset of all pipeline
 # stages — CI-only stages such as code-signing and publishing are excluded).
@@ -68,6 +74,7 @@ _LOCAL_STAGES = [
     VALIDATE_SBOM,
     SMOKE_TESTS,
     AQA_TESTS,
+    CREATE_API_METADATA,
     REPRODUCIBLE_COMPARE,
 ]
 
@@ -87,8 +94,6 @@ class StageResult(enum.Enum):
     def from_exit_code(exit_code: int) -> "StageResult":
         if exit_code == 0:
             return StageResult.SUCCESS
-        if exit_code == 1:
-            return StageResult.UNSTABLE
         return StageResult.FAILURE
 
 
@@ -142,10 +147,10 @@ class PipelineRunner:
         pipeline_result = StageResult.SUCCESS
         failure_exit_code = 0
 
-        def _run(stage_id, artifact_filter, extra_env=None):
+        def _run(stage_id, extra_env=None):
             """Run one stage, track the worst result; return False to stop pipeline."""
             nonlocal pipeline_result, failure_exit_code
-            exit_code = self.executor.run_stage(stage_id, artifact_filter, extra_env)
+            exit_code = self.executor.run_stage(stage_id, extra_env=extra_env)
             result = StageResult.from_exit_code(exit_code)
             if result == StageResult.UNSTABLE:
                 print(f"\n⚠️  {stage_id} completed as UNSTABLE (exit code: {exit_code})")
@@ -160,51 +165,51 @@ class PipelineRunner:
 
         try:
             # #####################################################################
-            # Stage: 01-initialize
+            # Stage: 010-initialize
             # #####################################################################
             if not skip_initialize and INITIALIZE in self.stages_to_run:
                 self.executor.run_initialize()
 
             # #####################################################################
-            # Stage: 02-build
+            # Stage: 020-build
             # #####################################################################
             if BUILD in self.stages_to_run:
-                if not _run(BUILD, "pipeline-config.json",
-                            {"TARGET_DIR": str(self.workspace_mgr.stage_workspace / "build_output")}):
+                if not _run(BUILD):
                     raise _PipelineAbort()
 
             # #####################################################################
-            # Stage: 12-validate-sbom
+            # Stage: 120-validate-sbom
             # #####################################################################
             if VALIDATE_SBOM in self.stages_to_run:
-                if not _run(VALIDATE_SBOM, "pipeline-config.json,*sbom*.json",
-                            {"TARGET_DIR": str(self.workspace_mgr.stage_workspace / "sbom_validation_output")}):
+                if not _run(VALIDATE_SBOM):
                     raise _PipelineAbort()
 
             # #####################################################################
-            # Stage: 13-smoke-tests
+            # Stage: 130-smoke-tests
             # #####################################################################
             if SMOKE_TESTS in self.stages_to_run and self.executor.condition_met(SMOKE_TESTS):
-                if not _run(SMOKE_TESTS, "pipeline-config.json,*.tar.gz,*.zip",
-                            {"TARGET_DIR": str(self.workspace_mgr.stage_workspace / "smoke_test_output")}):
+                if not _run(SMOKE_TESTS):
                     raise _PipelineAbort()
 
             # #####################################################################
-            # Stage: 14-aqa-tests
+            # Stage: 140-aqa-tests
             # #####################################################################
             if AQA_TESTS in self.stages_to_run and self.executor.condition_met(AQA_TESTS):
-                if not _run(AQA_TESTS, "pipeline-config.json,*.tar.gz,*.zip",
-                            {"TARGET_DIR": str(self.workspace_mgr.stage_workspace / "aqa_test_output")}):
+                if not _run(AQA_TESTS):
                     raise _PipelineAbort()
 
             # #####################################################################
-            # Stage: 20-reproducible-compare
+            # Stage: 180-create-api-metadata
+            # #####################################################################
+            if CREATE_API_METADATA in self.stages_to_run and self.executor.condition_met(CREATE_API_METADATA):
+                if not _run(CREATE_API_METADATA):
+                    raise _PipelineAbort()
+
+            # #####################################################################
+            # Stage: 200-reproducible-compare
             # #####################################################################
             if REPRODUCIBLE_COMPARE in self.stages_to_run and self.executor.condition_met(REPRODUCIBLE_COMPARE):
-                release_type = (self.args.release_type or "NIGHTLY").upper()
-                _run(REPRODUCIBLE_COMPARE, "pipeline-config.json,*.tar.gz,*.zip",
-                     {"TARGET_DIR": str(self.workspace_mgr.stage_workspace / "reproducible_compare_output"),
-                      "RELEASE": "true" if release_type == "RELEASE" else "false"})
+                _run(REPRODUCIBLE_COMPARE)
 
         except _PipelineAbort:
             pass

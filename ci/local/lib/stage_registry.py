@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 ################################################################################
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,7 +31,7 @@ def load_stage_registry(script_dir: Path) -> dict:
 
     Returns:
         Dict mapping stageId strings to their display labels,
-        e.g. {'02-build': 'Build', '13-smoke-tests': 'Smoke Tests', ...}
+        e.g. {'020-build': 'Build', '130-smoke-tests': 'Smoke Tests', ...}
     """
     registry_path = script_dir / "scripts" / "stages" / "pipeline-stages.json"
     with open(registry_path, "r", encoding="utf-8") as f:

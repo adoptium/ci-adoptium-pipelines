@@ -63,25 +63,25 @@ ci-adoptium-pipelines/
 │   │   ├── load-pipeline-config-json.py      # Generates pipeline-config.json
 │   │   ├── logging-utils.sh         # Logging utilities
 │   │   ├── python-runner.sh         # Wrapper to invoke Python scripts from shell
-│   │   ├── sbom-workspace-extractor.py  # Extracts SBOM artifacts from workspace
 │   │   └── workspace-cleanup.sh     # Workspace cleanup helper
 │   └── stages/
 │       ├── pipeline-stages.json     # Stage registry (names, order, conditions)
-│       ├── 02-build.sh                    # JDK compilation
-│       ├── 03-internal-code-sign.sh       # JMOD internal signing (Windows/Mac JDK 11+)
-│       ├── 04-assemble-images.sh          # OpenJDK make images after internal signing
-│       ├── 06-post-build-code-sign.sh     # Post-build binary code signing
-│       ├── 07-installer.sh                # Platform installers
-│       ├── 08-code-sign-installer.sh      # Installer code signing + macOS notarization
-│       ├── 09-sbom-sign.sh                # SBOM JSF signing
-│       ├── 10-digital-artifact-sign.sh    # GPG digital artifact signing
-│       ├── 11-verify-signing.sh           # Signature verification
-│       ├── 12-validate-sbom.sh            # SBOM validation
-│       ├── 13-smoke-tests.sh              # Smoke tests
-│       ├── 14-aqa-tests.sh                # AQA test suite
-│       ├── 15-tck-tests.sh                # TCK tests
-│       ├── 16-publish.sh                  # Artifact publication
-│       └── 20-reproducible-compare.sh     # Reproducible build comparison
+│       ├── 020-build.sh                    # JDK compilation
+│       ├── 030-internal-code-sign.sh       # JMOD internal signing (Windows/Mac JDK 11+)
+│       ├── 040-assemble-images.sh          # OpenJDK make images after internal signing
+│       ├── 060-post-build-code-sign.sh     # Post-build binary code signing
+│       ├── 070-installer.sh                # Platform installers
+│       ├── 080-code-sign-installer.sh      # Installer code signing + macOS notarization
+│       ├── 090-sbom-sign.sh                # SBOM JSF signing
+│       ├── 100-digital-artifact-sign.sh    # GPG digital artifact signing
+│       ├── 110-verify-signing.sh           # Signature verification
+│       ├── 120-validate-sbom.sh            # SBOM validation
+│       ├── 130-smoke-tests.sh              # Smoke tests
+│       ├── 140-aqa-tests.sh                # AQA test suite
+│       ├── 150-tck-tests.sh                # TCK tests
+│       ├── 180-create-api-metadata.sh      # API metadata & checksum generation
+│       ├── 190-publish.sh                  # Artifact publication
+│       └── 200-reproducible-compare.sh     # Reproducible build comparison
 │       (each stage also has a corresponding NN-stem.params.json)
 │
 ├── tests/
@@ -112,7 +112,7 @@ Both the Jenkins and local pipelines read build configuration from a separately 
 │   ├── jdk17_pipeline_config.json
 │   └── ...
 └── vendor-scripts/                    # Optional vendor-specific stage script overrides
-    ├── 02-build.sh
+    ├── 020-build.sh
     └── ...
 ```
 
@@ -130,21 +130,22 @@ Stage execution is controlled by two mechanisms:
 | # | Stage | Script | Owns parameter | stageCondition gates on | stageDisabled default |
 |---|---|---|---|---|---|
 | — | Initialize | _(ConfigHelper / run-pipeline.py)_ | — | always | — |
-| 02 | Build | `02-build.sh` | — | always | false |
-| 03 | Internal Code Sign | `03-internal-code-sign.sh` | `SIGN_ARTIFACTS` | `SIGN_ARTIFACTS=true`, macOS/Win, JDK≥11 | false |
-| 04 | Assemble Images | `04-assemble-images.sh` | — | `SIGN_ARTIFACTS=true`, macOS/Win, JDK≥11 | false |
-| 06 | Post-Build Code Sign | `06-post-build-code-sign.sh` | — | `SIGN_ARTIFACTS=true` | false |
-| 07 | Build Installer | `07-installer.sh` | `ENABLE_INSTALLERS` | `ENABLE_INSTALLERS=true` | false |
-| 08 | Code Sign Installer | `08-code-sign-installer.sh` | — | `ENABLE_INSTALLERS=true`, `SIGN_ARTIFACTS=true` | false |
-| 09 | SBOM Sign | `09-sbom-sign.sh` | — | `SIGN_ARTIFACTS=true`, `CREATE_SBOM=true` | false |
-| 10 | Digital Artifact Sign | `10-digital-artifact-sign.sh` | — | `SIGN_ARTIFACTS=true`, non-PR | false |
-| 11 | Verify Signing | `11-verify-signing.sh` | — | `SIGN_ARTIFACTS=true`, non-PR | false |
-| 12 | Validate SBOM | `12-validate-sbom.sh` | — | `CREATE_SBOM=true` (vendor impl required) | false |
-| 13 | Smoke Tests | `13-smoke-tests.sh` | — | `RUN_TESTS=true`, build succeeded | false |
-| 14 | AQA Tests | `14-aqa-tests.sh` | `RUN_TESTS` | `RUN_TESTS=true`, smoke tests passed | false |
-| 15 | TCK Tests | `15-tck-tests.sh` | `ENABLE_TCK` | `ENABLE_TCK=true`, Temurin, smoke tests passed | false |
-| 16 | Publish Artifacts | `16-publish.sh` | `PUBLISH_ARTIFACTS` | `PUBLISH_ARTIFACTS=true` | false |
-| 20 | Reproducible Compare | `20-reproducible-compare.sh` | `RUN_REPRODUCIBLE_COMPARE` | `RUN_REPRODUCIBLE_COMPARE=true`, `SCM_REF` set | false |
+| 02 | Build | `020-build.sh` | — | always | false |
+| 03 | Internal Code Sign | `030-internal-code-sign.sh` | `SIGN_ARTIFACTS` | `SIGN_ARTIFACTS=true`, macOS/Win, JDK≥11 | false |
+| 04 | Assemble Images | `040-assemble-images.sh` | — | `SIGN_ARTIFACTS=true`, macOS/Win, JDK≥11 | false |
+| 06 | Post-Build Code Sign | `060-post-build-code-sign.sh` | — | `SIGN_ARTIFACTS=true` | false |
+| 07 | Build Installer | `070-installer.sh` | `ENABLE_INSTALLERS` | `ENABLE_INSTALLERS=true` | false |
+| 08 | Code Sign Installer | `080-code-sign-installer.sh` | — | `ENABLE_INSTALLERS=true`, `SIGN_ARTIFACTS=true` | false |
+| 09 | SBOM Sign | `090-sbom-sign.sh` | — | `SIGN_ARTIFACTS=true`, `CREATE_SBOM=true` | false |
+| 10 | Digital Artifact Sign | `100-digital-artifact-sign.sh` | — | `SIGN_ARTIFACTS=true`, non-PR | false |
+| 11 | Verify Signing | `110-verify-signing.sh` | — | `SIGN_ARTIFACTS=true`, non-PR | false |
+| 12 | Validate SBOM | `120-validate-sbom.sh` | — | `CREATE_SBOM=true` (vendor impl required) | false |
+| 13 | Smoke Tests | `130-smoke-tests.sh` | — | `RUN_TESTS=true`, build succeeded | false |
+| 14 | AQA Tests | `140-aqa-tests.sh` | `RUN_TESTS` | `RUN_TESTS=true`, smoke tests passed | false |
+| 15 | TCK Tests | `150-tck-tests.sh` | `ENABLE_TCK` | `ENABLE_TCK=true`, Temurin, smoke tests passed | false |
+| 18 | Create API Metadata | `180-create-api-metadata.sh` | — | always | false |
+| 19 | Publish Artifacts | `190-publish.sh` | `PUBLISH_ARTIFACTS` | `PUBLISH_ARTIFACTS=true` | false |
+| 20 | Reproducible Compare | `200-reproducible-compare.sh` | `RUN_REPRODUCIBLE_COMPARE` | `RUN_REPRODUCIBLE_COMPARE=true`, `SCM_REF` set | false |
 
 ### Vendor Script Override
 
@@ -169,13 +170,13 @@ These files are sourced or invoked by every stage script regardless of whether i
 | File | Responsibility |
 |---|---|
 | [`logging-utils.sh`](scripts/lib/logging-utils.sh) | Timestamped `log_info` / `log_warn` / `log_error` / `log_section` functions written to stderr |
-| [`config-utils.sh`](scripts/lib/config-utils.sh) | `validate_standard_environment()` (checks `WORKSPACE`, `CONFIG_FILE`, defaults `TARGET_DIR`); `get_config_value()` / `get_config_bool()` JSON helpers via `jq` |
+| [`config-utils.sh`](scripts/lib/config-utils.sh) | `validate_standard_environment()` (checks `WORKSPACE`, `CONFIG_FILE`, defaults `TARGET_DIR`); `get_config_value()` / `get_config_bool()` JSON helpers via `json-utils.py` |
+| [`json-utils.py`](scripts/lib/json-utils.py) | Standalone Python JSON extraction helper used by `config-utils.sh`; no `jq` dependency |
 | [`artifact-utils.sh`](scripts/lib/artifact-utils.sh) | `prepare_output_dir()`, `copy_artifacts()`, `verify_artifact()`, `create_checksums()`, `create_stage_metadata()`, `determine_filename()` |
 | [`load-pipeline-config-json.py`](scripts/lib/load-pipeline-config-json.py) | Merges `adoptium_pipeline_config.json` + per-version platform JSON + runtime params → writes `pipeline-config.json` |
 | [`load-adoptium-pipeline-config-json.py`](scripts/lib/load-adoptium-pipeline-config-json.py) | Standalone reader for `adoptium_pipeline_config.json`; used by tools and the seed job |
 | [`collect-stage-params.py`](scripts/lib/collect-stage-params.py) | Collates all `*.params.json` sidecars (default + vendor) into a single document consumed by Job DSL and the local runner |
 | [`build-metadata-writer.py`](scripts/lib/build-metadata-writer.py) | Writes `build-metadata.json` after a successful build stage |
-| [`sbom-workspace-extractor.py`](scripts/lib/sbom-workspace-extractor.py) | Extracts the `Build Workspace Directory` path from an SBOM JSON file; used for reproducible build path padding |
 | [`python-runner.sh`](scripts/lib/python-runner.sh) | Resolves `python3`/`python` and execs a given `.py` script; used as the single shell-context Python entry point |
 | [`workspace-cleanup.sh`](scripts/lib/workspace-cleanup.sh) | Standalone script; cleans the ephemeral stage workspace pre/post stage based on `CLEANUP_TYPE` and `cleanWorkspaceAfterStage` config |
 
@@ -229,7 +230,9 @@ Each lib file is a plain CPS script loaded with `load()` — it calls pipeline s
 1. Build step: **Process Job DSLs** → `ci/jenkins/job-dsl/seed/seed_job_dsl.groovy`
 1. Run the seed job with your config repository URL and branch
 
-The seed job creates all launch and platform build jobs automatically.
+The seed job creates all launch jobs automatically.
+
+> To keep the deployed jobs in step with the vendor config repository, enable **GitHub hook trigger for GITScm polling** and/or **Poll SCM** under **Build Triggers** on a seed job whose SCM is the vendor config repository. See [`docs/JOB_DSL_AUTOMATION.md`](docs/JOB_DSL_AUTOMATION.md#step-2-create-the-pipeline-seed-job-in-jenkins).
 
 ### Required Jenkins Plugins
 
@@ -314,7 +317,7 @@ python3 ci/local/run-pipeline.py \
   --target-os linux \
   --architecture x64 \
   --config-repo-url https://github.com/adoptium/ci-temurin-config.git \
-  --start-from-stage 13-smoke-tests
+  --start-from-stage 130-smoke-tests
 
 # Vendor-specific config repository
 python3 ci/local/run-pipeline.py \

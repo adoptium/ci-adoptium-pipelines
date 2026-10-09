@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 ################################################################################
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -70,6 +71,8 @@ class StageExecutor:
         # _stage_conditions: stageId → list of { param, value } dicts
         self._stage_disabled: dict[str, bool] = {}
         self._stage_conditions: dict[str, list[dict]] = {}
+        self._stage_input_artifacts: dict[str, list[str]] = {}
+        self._stage_output_artifacts: dict[str, list[str]] = {}
 
         # Stage param values injected into every stage environment.
         # Populated by PipelineRunner after post-Initialize collation.
@@ -84,21 +87,19 @@ class StageExecutor:
     # ------------------------------------------------------------------
 
     def load_stage_metadata(self, collated: dict) -> None:
-        """Extract stageDisabled and stageCondition maps from the collated output."""
-        for grp in collated.get("groups", []):
-            stage_id = grp.get("stageId", "")
+        """Extract stageDisabled, stageCondition, stageInputArtifacts, and stageOutputArtifacts from collated output."""
+        for stage in collated.get("stages", []):
+            stage_id = stage.get("stageId", "")
             if not stage_id:
                 continue
-            # stageDisabled — first group seen per stageId wins
-            if stage_id not in self._stage_disabled:
-                self._stage_disabled[stage_id] = bool(grp.get("stageDisabled", False))
-            # stageCondition — merge across groups sharing the same stageId
-            conds = grp.get("stageCondition", [])
+            self._stage_disabled[stage_id] = bool(stage.get("stageDisabled", False))
+            conds = stage.get("stageCondition") or []
             if conds:
-                existing = self._stage_conditions.get(stage_id, [])
-                seen_params = {c["param"] for c in existing}
-                merged = existing + [c for c in conds if c["param"] not in seen_params]
-                self._stage_conditions[stage_id] = merged
+                self._stage_conditions[stage_id] = conds
+            if "stageInputArtifacts" in stage:
+                self._stage_input_artifacts[stage_id] = stage["stageInputArtifacts"]
+            if "stageOutputArtifacts" in stage:
+                self._stage_output_artifacts[stage_id] = stage["stageOutputArtifacts"]
 
     def condition_met(self, stage_id: str) -> bool:
         """
@@ -147,11 +148,7 @@ class StageExecutor:
     def _get_resolver(self) -> StageResolver:
         """Return a StageResolver, (re-)creating it if the config repo has been
         cloned since the last call (i.e. after stage_initialize())."""
-        config_repo_root = None
-        if self._args.config_repo_url:
-            candidate = self._workspace_mgr.pipeline_workspace / "config-repo"
-            if candidate.exists():
-                config_repo_root = candidate
+        config_repo_root = self._config_repo_root()
 
         if self._resolver is None or (
             config_repo_root is not None
@@ -163,7 +160,15 @@ class StageExecutor:
 
         return self._resolver
 
-    def _build_env(self, extra: dict | None = None) -> dict:
+    def _config_repo_root(self):
+        """Return the config-repo path if it has been cloned, else None."""
+        if self._args.config_repo_url:
+            candidate = self._workspace_mgr.pipeline_workspace / "config-repo"
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _build_env(self, stage_id: str, extra: dict | None = None) -> dict:
         """Build the standard environment dict passed to every stage script."""
         return build_stage_env(
             script_dir=self._script_dir,
@@ -173,6 +178,8 @@ class StageExecutor:
             release_type=self._args.release_type or "NIGHTLY",
             clean_workspace=self._args.clean_workspace,
             stage_param_values=self.stage_param_values,
+            stage_id=stage_id,
+            config_repo_root=self._config_repo_root(),
             extra=extra,
         )
 
@@ -180,7 +187,12 @@ class StageExecutor:
     # Stage execution
     # ------------------------------------------------------------------
 
-    def run_stage(self, stage_id: str, artifact_filter: str, extra_env: dict | None = None) -> int:
+    def run_stage(
+        self,
+        stage_id: str,
+        artifact_filter: str | None = None,
+        extra_env: dict | None = None,
+    ) -> int:
         """
         Execute one pipeline stage — the local equivalent of a Jenkins stage block.
 
@@ -193,26 +205,37 @@ class StageExecutor:
           6. Post-cleanup (≈ finalizeStage cleanWs)
 
         Returns:
-            Exit code — 0 = SUCCESS, 1 = UNSTABLE, >1 = FAILURE.
+            Exit code — 0 = SUCCESS, non-zero = FAILURE.
         """
         stage_label = self._stage_registry.get(stage_id, stage_id)
         print(f"\n{'=' * 80}")
         print(f"STAGE: {stage_label}")
         print("=" * 80)
 
-        self._workspace_mgr.cleanup_stage_workspace("pre")
-        self._workspace_mgr.restore_stage_inputs(stage_label, artifact_filter)
+        input_artifacts = self._stage_input_artifacts.get(stage_id)
+        output_artifacts = self._stage_output_artifacts.get(stage_id)
 
-        env = self._build_env(extra_env)
+        self._workspace_mgr.cleanup_stage_workspace("pre")
+        self._workspace_mgr.restore_stage_inputs(
+            stage_label,
+            input_artifacts=input_artifacts,
+            artifact_filter=artifact_filter,
+        )
+
+        env = self._build_env(stage_id, extra_env)
         exit_code = self._get_resolver().run(stage_id, env)
 
-        self._workspace_mgr.archive_stage_outputs(stage_label, target_dir=env.get("TARGET_DIR"))
-        self._workspace_mgr.cleanup_stage_workspace("post")
+        self._workspace_mgr.archive_stage_outputs(
+            stage_label,
+            target_dir=env.get("TARGET_DIR"),
+            output_patterns=output_artifacts,
+        )
+        self._workspace_mgr.cleanup_stage_workspace("post", stage_failed=(exit_code != 0))
         return exit_code
 
     def run_initialize(self) -> None:
         """
-        Stage 01-initialize: clone the config repo and generate pipeline-config.json.
+        Stage 010-initialize: clone the config repo and generate pipeline-config.json.
 
         Unique logic that is not reducible to run_stage() because it drives the
         workspace setup and config-repo clone that every subsequent stage depends on.

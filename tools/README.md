@@ -23,16 +23,9 @@ migrate-groovy-pipeline-configs.py   ← top-level: run this
 **Usage**:
 
 ```bash
-# Basic migration (jobs created at the Jenkins root)
 python3 tools/migrate-groovy-pipeline-configs.py \
     --source ~/workspace/ci-jenkins-pipelines/pipelines/jobs/configurations \
     --output ~/workspace/ci-temurin-config
-
-# Place all generated jobs inside a Jenkins folder
-python3 tools/migrate-groovy-pipeline-configs.py \
-    --source ~/workspace/ci-jenkins-pipelines/pipelines/jobs/configurations \
-    --output ~/workspace/ci-temurin-config \
-    --pipeline-base-folder MyOrg/OpenJDK
 ```
 
 **Options**:
@@ -41,7 +34,6 @@ python3 tools/migrate-groovy-pipeline-configs.py \
 |---|---|
 | `--source` / `-s` | Source directory containing `*_pipeline_config.groovy` files (required) |
 | `--output` / `-o` | Output directory — receives `jenkins_job_config.json` and `configurations/*.json` (required) |
-| `--pipeline-base-folder FOLDER` | Jenkins folder path under which all generated jobs and views will be placed (e.g. `MyOrg/OpenJDK`). Written as `pipelineBaseFolder` in `jenkins_job_config.json`. Omit to generate at the Jenkins root. |
 | `--dry-run` / `-n` | Preview what would be converted without writing files |
 | `--verbose` / `-v` | Show detailed conversion output |
 | `--force` / `-f` | Overwrite existing JSON files |
@@ -71,7 +63,6 @@ python3 tools/migrate-groovy-pipeline-configs.py \
   "repository": {
     "url": "https://github.com/adoptium/ci-adoptium-pipelines.git",
     "branch": "main",
-    "credentialsId": "",
     "buildRepoUrl": "https://github.com/adoptium/temurin-build.git",
     "buildBranch": "master",
     "aqaRepoUrl": "https://github.com/adoptium/aqa-tests.git",
@@ -86,38 +77,32 @@ python3 tools/migrate-groovy-pipeline-configs.py \
 {
   "jenkinsfilePath": "ci/jenkins/Jenkinsfile.declarative",
   "pipelineTimeoutHours": 8,
-  "activeNodeTimeoutMinutes": 10,
-  "jobConfiguration": {
-    "defaultParameters": {
-      "VARIANT": "temurin",
-      "CLEAN_WORKSPACE_AFTER_STAGE": true,
-      "RUN_TESTS": true,
-      "ENABLE_INSTALLERS": true,
-      "SIGN_ARTIFACTS": true,
-      "PUBLISH_ARTIFACTS": false,
-      "RUN_REPRODUCIBLE_COMPARE": false
-    },
-    "logRotation": {
-      "daysToKeep": 30,
-      "numToKeep": 50,
-      "artifactDaysToKeep": 7,
-      "artifactNumToKeep": 10
+  "stageAgentLabels": { "...": "..." },
+  "deployments": [
+    {
+      "name": "release",
+      "folder": "release",
+      "description": "Production release pipeline",
+      "jobConfiguration": {
+        "defaultParameters": {
+          "VARIANT": "temurin",
+          "CLEAN_WORKSPACE_AFTER_STAGE": true,
+          "RUN_TESTS": true,
+          "ENABLE_INSTALLERS": true,
+          "SIGN_ARTIFACTS": true,
+          "PUBLISH_ARTIFACTS": false,
+          "RUN_REPRODUCIBLE_COMPARE": false,
+          "RELEASE_TYPE": "RELEASE"
+        },
+        "logRotation": {
+          "daysToKeep": 30,
+          "numToKeep": 50,
+          "artifactDaysToKeep": 7,
+          "artifactNumToKeep": 10
+        }
+      }
     }
-  },
-  "stageAgentLabels": { "...": "..." }
-}
-```
-
-When `--pipeline-base-folder` is supplied the field is inserted between `activeNodeTimeoutMinutes` and `jobConfiguration`:
-
-```json
-{
-  "jenkinsfilePath": "ci/jenkins/Jenkinsfile.declarative",
-  "pipelineTimeoutHours": 8,
-  "activeNodeTimeoutMinutes": 10,
-  "pipelineBaseFolder": "MyOrg/OpenJDK",
-  "jobConfiguration": { "...": "..." },
-  "stageAgentLabels": { "...": "..." }
+  ]
 }
 ```
 
@@ -184,14 +169,7 @@ python3 tools/migrate-groovy-pipeline-configs.py \
     --output ~/workspace/ci-temurin-config
 ```
 
-To place all generated Jenkins jobs inside a folder (e.g. `MyOrg/OpenJDK`), add `--pipeline-base-folder`:
-
-```bash
-python3 tools/migrate-groovy-pipeline-configs.py \
-    --source ~/workspace/ci-jenkins-pipelines/pipelines/jobs/configurations \
-    --output ~/workspace/ci-temurin-config \
-    --pipeline-base-folder MyOrg/OpenJDK
-```
+> **Placing jobs in a folder**: set the `PIPELINE_BASE_FOLDER` parameter on the seed job in Jenkins instead — this allows the same generated config to be deployed into multiple folders without re-running the migration tool.
 
 Expected output:
 
@@ -222,13 +200,13 @@ Generated files:
 
 ```bash
 # Inspect top-level config
-cat ~/workspace/ci-temurin-config/jenkins_job_config.json | jq .
+python3 -m json.tool ~/workspace/ci-temurin-config/jenkins_job_config.json
 
 # Inspect a version config
-cat ~/workspace/ci-temurin-config/configurations/jdk21_pipeline_config.json | jq .
+python3 -m json.tool ~/workspace/ci-temurin-config/configurations/jdk21_pipeline_config.json
 
 # Verify active versions list
-jq '.activeJdkVersions' ~/workspace/ci-temurin-config/jenkins_job_config.json
+python3 scripts/lib/json-utils.py get .activeJdkVersions ~/workspace/ci-temurin-config/jenkins_job_config.json
 ```
 
 Pay particular attention to:
@@ -236,7 +214,8 @@ Pay particular attention to:
 - Nested maps and lists (complex Groovy structures may need manual adjustment)
 - Variant-specific values (e.g. `buildArgs: [temurin: '...', hotspot: '...']` → `"buildArgs": {"temurin": "...", "hotspot": "..."}`)
 - `enabled` flags — verify disabled versions are correctly set to `false`
-- `repository` block in `jenkins_job_config.json` — update `url`, `branch`, `credentialsId` for your org
+- `repository` block in `adoptium_pipeline_config.json` — update `url` and `branch` for your org
+- `pipelineRepoCredentialsId` / `configRepoCredentialsId` in `jenkins_credential_config.json` — set to your Jenkins credential ID if authentication is required (e.g. for private repos or to avoid GitHub API rate limits)
 
 ### Step 4 — Commit to the configuration repository
 

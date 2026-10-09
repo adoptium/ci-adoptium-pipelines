@@ -11,6 +11,7 @@ The configuration is split across three file types with clearly separated concer
 |---|---|---|
 | `adoptium_pipeline_config.json` | repository root | CI-agnostic: active versions, build defaults, repository references |
 | `jenkins_job_config.json` | repository root | Jenkins-specific: Jenkinsfile path, timeout, job parameters, log rotation |
+| `jenkins_credential_config.json` | repository root | Jenkins-specific: credential IDs for SCM checkouts and per-stage secret injection |
 | `configurations/jdkNN_pipeline_config.json` | `configurations/` | Per-version: platform build matrix |
 
 ---
@@ -34,7 +35,6 @@ repository references that apply regardless of which CI system runs the pipeline
   "repository": {
     "url": "https://github.com/adoptium/ci-adoptium-pipelines.git",
     "branch": "main",
-    "credentialsId": "",
     "buildRepoUrl": "https://github.com/adoptium/temurin-build.git",
     "buildBranch": "master",
     "aqaRepoUrl": "https://github.com/adoptium/aqa-tests.git",
@@ -58,7 +58,6 @@ repository references that apply regardless of which CI system runs the pipeline
 | `repository` | object | ✅ | Repository references for pipeline code and build tooling |
 | `repository.url` | string | ✅ | Git URL of the CI pipeline repository |
 | `repository.branch` | string | ✅ | Branch of the CI pipeline repository to check out |
-| `repository.credentialsId` | string | ✅ | Jenkins credentials ID for pipeline repository checkout. Empty string for public repos |
 | `repository.buildRepoUrl` | string | ✅ | Git URL of the temurin-build repository |
 | `repository.buildBranch` | string | ✅ | Branch of the temurin-build repository |
 | `repository.aqaRepoUrl` | string | ✅ | Git URL of the aqa-tests repository |
@@ -68,7 +67,7 @@ repository references that apply regardless of which CI system runs the pipeline
 
 ## `jenkins_job_config.json`
 
-Jenkins-specific configuration. Contains two groups: **job-creation settings** (`jenkinsfilePath`, `pipelineTimeoutHours`, `activeNodeTimeoutMinutes`, `jobConfiguration`) used by the seed job only; and **agent-selection settings** (`stageAgentLabels`) read at build runtime by `ConfigHelper.generateJenkinsConfig()` to resolve which node each stage runs on.
+Jenkins-specific configuration. Contains two groups: **job-creation settings** (`jenkinsfilePath`, `pipelineTimeoutHours`, `deployments[].jobConfiguration`) used by the seed job only; and **agent-selection settings** (`stageAgentLabels`) read at build runtime by `ConfigHelper.generateJenkinsConfig()` to resolve which node each stage runs on.
 
 > For a full annotated example and a description of how each section is consumed, see [CODE_CONFIG_SEPARATION.md §2](./CODE_CONFIG_SEPARATION.md#2-jenkins_job_configjson--jenkins-specific-job-and-agent-settings).
 
@@ -76,44 +75,51 @@ Jenkins-specific configuration. Contains two groups: **job-creation settings** (
 {
   "jenkinsfilePath": "ci/jenkins/Jenkinsfile.declarative",
   "pipelineTimeoutHours": 8,
-  "activeNodeTimeoutMinutes": 10,
   "stageAgentLabels": {
     "__any__":               "ci.role.worker",
-    "01-initialize":         "ci.role.worker",
-    "02-build":              "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
-    "03-internal-code-sign": "eclipse-codesign",
-    "04-assemble-images":    "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
-    "06-post-build-code-sign": "ci.role.worker",
-    "07-installer":          "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
-    "08-code-sign-installer": "ci.role.worker",
-    "09-sbom-sign":          "ci.role.worker",
-    "10-digital-artifact-sign": "ci.role.worker",
-    "11-verify-signing":     "ci.role.worker",
-    "12-validate-sbom":      "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
-    "13-smoke-tests":        "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
-    "14-aqa-tests":          "ci.role.build&&hw.arch.{arch}",
-    "15-tck-tests":          "ci.role.build&&hw.arch.{arch}",
-    "16-publish":            "ci.role.worker",
-    "20-reproducible-compare": "ci.role.build&&sw.os.{os}&&hw.arch.{arch}"
+    "010-initialize":         "ci.role.worker",
+    "020-build":              "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
+    "030-internal-code-sign": "eclipse-codesign",
+    "040-assemble-images":    "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
+    "060-post-build-code-sign": "ci.role.worker",
+    "070-installer":          "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
+    "080-code-sign-installer": "ci.role.worker",
+    "090-sbom-sign":          "ci.role.worker",
+    "100-digital-artifact-sign": "ci.role.worker",
+    "110-verify-signing":     "ci.role.worker",
+    "120-validate-sbom":      "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
+    "130-smoke-tests":        "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
+    "140-aqa-tests":          "ci.role.build&&hw.arch.{arch}",
+    "150-tck-tests":          "ci.role.build&&hw.arch.{arch}",
+    "190-publish":            "ci.role.worker",
+    "200-reproducible-compare": "ci.role.build&&sw.os.{os}&&hw.arch.{arch}"
   },
-  "jobConfiguration": {
-    "defaultParameters": {
-      "VARIANT": "temurin",
-      "CLEAN_WORKSPACE_AFTER_STAGE": true,
-      "CREATE_SBOM": true,
-      "RUN_TESTS": true,
-      "ENABLE_INSTALLERS": true,
-      "SIGN_ARTIFACTS": true,
-      "PUBLISH_ARTIFACTS": false,
-      "RUN_REPRODUCIBLE_COMPARE": false
-    },
-    "logRotation": {
-      "daysToKeep": 30,
-      "numToKeep": 50,
-      "artifactDaysToKeep": 7,
-      "artifactNumToKeep": 10
+  "deployments": [
+    {
+      "name": "release",
+      "folder": "release",
+      "description": "Production release pipeline",
+      "jobConfiguration": {
+        "defaultParameters": {
+          "VARIANT": "temurin",
+          "CLEAN_WORKSPACE_AFTER_STAGE": true,
+          "CREATE_SBOM": true,
+          "RUN_TESTS": true,
+          "ENABLE_INSTALLERS": true,
+          "SIGN_ARTIFACTS": true,
+          "PUBLISH_ARTIFACTS": false,
+          "RUN_REPRODUCIBLE_COMPARE": false,
+          "RELEASE_TYPE": "RELEASE"
+        },
+        "logRotation": {
+          "daysToKeep": 30,
+          "numToKeep": 50,
+          "artifactDaysToKeep": 7,
+          "artifactNumToKeep": 10
+        }
+      }
     }
-  }
+  ]
 }
 ```
 
@@ -123,16 +129,108 @@ Jenkins-specific configuration. Contains two groups: **job-creation settings** (
 |---|---|---|---|
 | `jenkinsfilePath` | string | ✅ | Relative path within the pipeline repository to the Jenkinsfile |
 | `pipelineTimeoutHours` | integer | ☑️ default `8` | Maximum wall-clock hours a platform build pipeline run is allowed before Jenkins aborts it. Applied as a job-level `buildTimeoutWrapper` (Build Timeout plugin) by the Job DSL when the platform build job is created or regenerated. |
-| `activeNodeTimeoutMinutes` | integer | ☑️ default `10` | Minutes to wait for **at least one online agent** matching a stage label before failing. Jenkins queuing (all agents busy) is unaffected — this only fires when **zero** agents matching the label are online. Supports cloud provisioners that take time to spin up a new agent. Exposed as the `CONFIG_ACTIVE_NODE_TIMEOUT` env var at runtime. |
-| `pipelineBaseFolder` | string | ☑️ optional | Jenkins folder path under which all generated jobs and views are placed (e.g. `"MyOrg/OpenJDK"`). Intermediate folders are created automatically. Omit or set to `""` to generate everything at the Jenkins root. Consumed by the seed job and the launch job. |
-| `stageAgentLabels` | object | ✅ | Map of **stage ID** → label template. Keys must match stage IDs from `scripts/stages/pipeline-stages.json` (e.g. `"02-build"`, `"13-smoke-tests"`). `{os}` and `{arch}` placeholders are resolved at build runtime to `sw.os.*` / `hw.arch.*` values. The special key `__any__` sets the fallback label for any stage not explicitly listed; also used for launch-pipeline worker stages that require `python3`; defaults to `ci.role.worker` if absent. |
-| `jobConfiguration` | object | ✅ | Jenkins job settings (seed job only) |
-| `jobConfiguration.defaultParameters` | object | ✅ | Default values for Jenkins build parameters (can be overridden at trigger time). Keys are the stage-param names defined in `scripts/stages/*.params.json`. |
-| `jobConfiguration.logRotation` | object | ✅ | Jenkins log/artifact retention policy |
-| `jobConfiguration.logRotation.daysToKeep` | integer | ✅ | Number of days to retain build logs |
-| `jobConfiguration.logRotation.numToKeep` | integer | ✅ | Maximum number of build records to retain |
-| `jobConfiguration.logRotation.artifactDaysToKeep` | integer | ✅ | Number of days to retain build artifacts |
-| `jobConfiguration.logRotation.artifactNumToKeep` | integer | ✅ | Maximum number of builds whose artifacts are retained |
+| `stageAgentLabels` | object | ✅ | Map of **stage ID** → label template. Keys must match stage IDs from `scripts/stages/pipeline-stages.json` (e.g. `"020-build"`, `"130-smoke-tests"`). `{os}` and `{arch}` placeholders are resolved at build runtime to `sw.os.*` / `hw.arch.*` values. The special key `__any__` sets the fallback label for any stage not explicitly listed; also used for launch-pipeline worker stages that require `python3`; defaults to `ci.role.worker` if absent. |
+| `deployments` | array | ☑️ | List of deployment descriptors. Each deployment gets its own Jenkins folder with independent jobs, triggers, and security. When absent the seed job creates a single set of jobs directly under `pipelineBaseFolder`. |
+| `deployments[].name` | string | ✅ | Logical name for the deployment (e.g. `"release"`, `"beta"`). Used in job descriptions and trigger parameter values. |
+| `deployments[].folder` | string | ✅ | Subfolder name created under `pipelineBaseFolder` (e.g. `"release"` → `pipelineBaseFolder/release/`). |
+| `deployments[].description` | string | ☑️ | Human-readable description shown on the Jenkins folder. |
+| `deployments[].jobConfiguration` | object | ✅ | Jenkins job settings for this deployment (seed job only). Each deployment declares its own complete set — there is no shared base to inherit from. |
+| `deployments[].jobConfiguration.defaultParameters` | object | ✅ | Default values for all Jenkins build parameters created for this deployment's launch and trigger jobs. Keys are the stage-param names defined in `scripts/stages/*.params.json`. |
+| `deployments[].jobConfiguration.logRotation` | object | ✅ | Jenkins log/artifact retention policy for this deployment's jobs. |
+| `deployments[].jobConfiguration.logRotation.daysToKeep` | integer | ✅ | Number of days to retain build logs |
+| `deployments[].jobConfiguration.logRotation.numToKeep` | integer | ✅ | Maximum number of build records to retain |
+| `deployments[].jobConfiguration.logRotation.artifactDaysToKeep` | integer | ✅ | Number of days to retain build artifacts |
+| `deployments[].jobConfiguration.logRotation.artifactNumToKeep` | integer | ✅ | Maximum number of builds whose artifacts are retained |
+| `deployments[].authorization` | object | ☑️ | Jenkins folder-level security ACLs. Omit to inherit from the parent folder. |
+| `deployments[].authorization.inheritParent` | boolean | ☑️ default `true` | When `false`, disables ACL inheritance from the parent folder and applies only the listed permissions. |
+| `deployments[].authorization.permissions` | array | ☑️ | List of `{ "permission": "Job/Build", "grantee": "group-or-user" }` entries. |
+| `deployments[].triggers` | array | ☑️ | List of automated trigger descriptors for this deployment. Each entry: `{ "type": "<trigger-stem>", "cronSchedule": "<cron>" }`. See `docs/TRIGGER_ARCHITECTURE.md` for supported types. |
+
+---
+
+## `jenkins_credential_config.json`
+
+Jenkins-specific credential configuration. Contains Jenkins credential IDs for SCM checkouts (pipelines
+repository and config repository) as well as per-stage secret injection used by `CredentialHelper`.
+
+This file is the single home for all Jenkins credential IDs — credential IDs must never appear in the
+CI-agnostic `adoptium_pipeline_config.json`.
+
+```json
+{
+  "pipelineRepoCredentialsId": "github-pipelines-credential",
+  "configRepoCredentialsId":   "github-config-repo-credential",
+  "jenkinsApiCredentialsId":   "jenkins-api-token",
+  "credentials": {
+    "GITHUB_TOKEN": {
+      "type": "string",
+      "credentialId": "github-token",
+      "description": "GitHub PAT for authenticated git HTTPS operations. Injected into every stage via ALL_STAGES."
+    },
+    "DOCKER_REGISTRY_CREDENTIAL": {
+      "type": "usernamePassword",
+      "credentialId": "my-registry-credential",
+      "usernameEnvVar": "REGISTRY_USER",
+      "passwordEnvVar": "REGISTRY_PASS",
+      "description": "Registry login for build images"
+    }
+  },
+  "stageCredentials": {
+    "ALL_STAGES": ["GITHUB_TOKEN"],
+    "020-build":   ["DOCKER_REGISTRY_CREDENTIAL"]
+  }
+}
+```
+
+### Fields (credential config)
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `pipelineRepoCredentialsId` | string | ☑️ optional | Jenkins credentials ID used to check out the `ci-adoptium-pipelines` repository. Empty string or absent for public repos |
+| `configRepoCredentialsId` | string | ☑️ optional | Jenkins credentials ID used to check out the vendor config repository itself. Recommended even for public repos to avoid GitHub rate-limiting on unauthenticated git access |
+| `jenkinsApiCredentialsId` | string | ✅ **required** for `detect-ga-tag` | Jenkins **Username with password** credential whose username is a Jenkins service account and password is its API token. Used by `Jenkinsfile.trigger` to query build history before triggering a GA release, preventing duplicate triggers. The job fails immediately if this is absent when `detect-ga-tag` runs |
+| `credentials` | object | ☑️ optional | Map of credential name → definition. Names are arbitrary identifiers used in `stageCredentials` |
+| `credentials[name].type` | string | ✅ | One of `string`, `usernamePassword`, `sshUserPrivateKey`, `file` |
+| `credentials[name].credentialId` | string | ✅ | Jenkins credential store ID |
+| `credentials[name].description` | string | ☑️ optional | Human-readable note — not used by the pipeline |
+| `credentials[name].envVar` | string | ☑️ `string` only | Env var name the secret is injected into. Defaults to the credential key name. Use this to inject the same well-known name (e.g. `GITHUB_TOKEN`) from different Jenkins credentials in different stages — see precedence rules below |
+| `credentials[name].usernameEnvVar` | string | ☑️ `usernamePassword` only | Env var receiving the username (default: `<NAME>_USER`) |
+| `credentials[name].passwordEnvVar` | string | ☑️ `usernamePassword` only | Env var receiving the password (default: `<NAME>_PASS`) |
+| `credentials[name].keyFileEnvVar` | string | ☑️ `sshUserPrivateKey` only | Env var receiving the key file path (default: `<NAME>_KEYFILE`) |
+| `credentials[name].fileEnvVar` | string | ☑️ `file` only | Env var receiving the file path (default: `<NAME>_FILE`) |
+| `stageCredentials` | object | ☑️ optional | Map of stage ID → list of credential names to inject. The special key `ALL_STAGES` injects into every stage |
+
+#### `envVar` precedence rules for `string` credentials
+
+When multiple credentials resolve to the same `envVar` name for a single stage:
+
+- **Stage-specific beats ALL_STAGES** — if a credential listed directly under a stage ID (e.g. `"190-publish"`) resolves to the same `envVar` as one listed under `ALL_STAGES`, the stage-specific credential wins. The `ALL_STAGES` entry is silently suppressed for that stage only; other stages still receive it normally.
+- **Two stage-specific entries with the same `envVar` is an error** — `load-jenkins-credential-config.py` will reject this at config-load time with a clear error message. This prevents ambiguous bindings.
+
+Example — use a higher-privilege PAT only in the publish stage:
+
+```json
+{
+  "credentials": {
+    "GENERAL_PAT": {
+      "type": "string",
+      "credentialId": "general-github-pat",
+      "envVar": "GITHUB_TOKEN"
+    },
+    "PUBLISH_PAT": {
+      "type": "string",
+      "credentialId": "publish-github-pat",
+      "envVar": "GITHUB_TOKEN"
+    }
+  },
+  "stageCredentials": {
+    "ALL_STAGES":   ["GENERAL_PAT"],
+    "190-publish":   ["PUBLISH_PAT"]
+  }
+}
+```
+
+In this config: every stage receives `GITHUB_TOKEN` from `general-github-pat`, except `190-publish` which receives `GITHUB_TOKEN` from `publish-github-pat` (`GENERAL_PAT` is suppressed for that stage).
 
 ---
 

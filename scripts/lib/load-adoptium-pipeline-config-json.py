@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 ################################################################################
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,7 +26,7 @@ This file is the single source of truth for:
   - defaultVariant
   - defaultScmReference
   - configFilePrefix / configFileSuffix
-  - repository (url, branch, credentialsId)
+  - repository (url, branch)
 
 Usage:
     # From a local config repo checkout
@@ -52,6 +53,7 @@ import json
 import sys
 import urllib.request
 from pathlib import Path
+from typing import List, Optional
 
 CONFIG_FILENAME = "adoptium_pipeline_config.json"
 
@@ -90,7 +92,7 @@ def load_from_remote(repo_url: str, branch: str) -> dict:
         sys.exit(1)
 
 
-def get_active_versions(config: dict) -> list[str]:
+def get_active_versions(config: dict) -> List[str]:
     """Return list of enabled JDK version strings."""
     return [
         v["version"]
@@ -99,7 +101,7 @@ def get_active_versions(config: dict) -> list[str]:
     ]
 
 
-def output_json(config: dict, field: str | None):
+def output_json(config: dict, field: Optional[str]):
     """Output as JSON."""
     if field:
         value = config.get(field)
@@ -137,7 +139,6 @@ def output_env(config: dict):
     )
     print(f"export ADOPTIUM_REPO_URL=\"{repo.get('url', '')}\"")
     print(f"export ADOPTIUM_REPO_BRANCH=\"{repo.get('branch', 'main')}\"")
-    print(f"export ADOPTIUM_REPO_CREDENTIALS_ID=\"{repo.get('credentialsId', '')}\"")
     print(f"export ADOPTIUM_BUILD_REPO_URL=\"{repo.get('buildRepoUrl', '')}\"")
     print(f"export ADOPTIUM_BUILD_BRANCH=\"{repo.get('buildBranch', '')}\"")
     print(f"export ADOPTIUM_AQA_REPO_URL=\"{repo.get('aqaRepoUrl', '')}\"")

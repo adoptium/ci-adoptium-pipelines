@@ -10,6 +10,7 @@ This directory contains reference documentation for the Adoptium CI pipeline inf
 |---|---|
 | Set up Jenkins from scratch | [JOB_DSL_AUTOMATION.md](./JOB_DSL_AUTOMATION.md) |
 | Check Jenkins instance requirements | [JENKINS_REQUIREMENTS.md](./JENKINS_REQUIREMENTS.md) |
+| Fix a build stuck on "Stopping part of…" | [JENKINS_PLACEHOLDER_TASK_BUG.md](./JENKINS_PLACEHOLDER_TASK_BUG.md) |
 | Understand the job naming convention | [BUILD_JOB_NAMING_CONVENTION.md](./BUILD_JOB_NAMING_CONVENTION.md) |
 | Understand the overall design | [CI_AGNOSTIC_ARCHITECTURE.md](./CI_AGNOSTIC_ARCHITECTURE.md) |
 | Configure a build | [CODE_CONFIG_SEPARATION.md](./CODE_CONFIG_SEPARATION.md) |
@@ -19,6 +20,8 @@ This directory contains reference documentation for the Adoptium CI pipeline inf
 | Add or modify a stage script | [CI_AGNOSTIC_ARCHITECTURE.md](./CI_AGNOSTIC_ARCHITECTURE.md) (Per-Stage Summary) + [UNIVERSAL_STAGE_PATTERN.md](./UNIVERSAL_STAGE_PATTERN.md) |
 | Understand BUILD_UID tracking | [BUILD_UID_INTEGRATION.md](./BUILD_UID_INTEGRATION.md) |
 | Work with reproducible builds | [REPRO_COMPARE_INTEGRATION.md](./REPRO_COMPARE_INTEGRATION.md) |
+| Inject credentials into a stage (Jenkins) | [STAGE_CREDENTIALS.md](./STAGE_CREDENTIALS.md) |
+| Authenticate git operations against GitHub | [GITHUB_AUTH_GIT_OPERATIONS.md](./GITHUB_AUTH_GIT_OPERATIONS.md) |
 | Convert legacy Groovy configs | [`tools/README.md`](../tools/README.md) |
 
 ---
@@ -27,6 +30,8 @@ This directory contains reference documentation for the Adoptium CI pipeline inf
 
 - **[CI_AGNOSTIC_ARCHITECTURE.md](./CI_AGNOSTIC_ARCHITECTURE.md)** — 3-layer design (Configuration / Shell Scripts / CI Orchestration), standard interface contract, per-stage summary
 - **[UNIVERSAL_STAGE_PATTERN.md](./UNIVERSAL_STAGE_PATTERN.md)** — How to write a new stage script following the standard pattern
+- **[TRIGGER_ARCHITECTURE.md](./TRIGGER_ARCHITECTURE.md)** — CI-agnostic trigger system: upstream OpenJDK tag detection and automatic build pipeline dispatch
+- **[DEVELOPMENT_GUIDE.md](./DEVELOPMENT_GUIDE.md)** — Local linting and testing, testing strategy, architecture and code style rules for contributors
 
 ## Configuration
 
@@ -40,6 +45,7 @@ This directory contains reference documentation for the Adoptium CI pipeline inf
 - **[BUILD_JOB_NAMING_CONVENTION.md](./BUILD_JOB_NAMING_CONVENTION.md)** — Job naming schema (`Build_openjdk<version>_<distro>_<arch>_<os>`), folder layout, and AQA convention alignment
 - **[JOB_DSL_AUTOMATION.md](./JOB_DSL_AUTOMATION.md)** — Complete seed job and Job DSL setup guide; how launch jobs and platform build jobs are created
 - **[BUILD_UID_INTEGRATION.md](./BUILD_UID_INTEGRATION.md)** — `BUILD_UID` and `GROUP_UID` lifecycle; `BUILD_STAGE_RESULTS` serialisation; prerequisite validation
+- **[JENKINS_PLACEHOLDER_TASK_BUG.md](./JENKINS_PLACEHOLDER_TASK_BUG.md)** — Known Jenkins bug: build hangs permanently with "Stopping part of…"; diagnosis and Script Console fix
 
 ## Workspace Management
 
@@ -53,6 +59,8 @@ This directory contains reference documentation for the Adoptium CI pipeline inf
 ## Pipeline Features
 
 - **[REPRO_COMPARE_INTEGRATION.md](./REPRO_COMPARE_INTEGRATION.md)** — Integration details: `REPRODUCIBLE_COMPARE_BUILD` parameter, `SCM_REF` requirement, `TARGET_DIR` outputs
+- **[STAGE_CREDENTIALS.md](./STAGE_CREDENTIALS.md)** — Per-stage Jenkins credential injection via `jenkins_credential_config.json`; supported types; `ALL_STAGES` wildcard; container forwarding
+- **[GITHUB_AUTH_GIT_OPERATIONS.md](./GITHUB_AUTH_GIT_OPERATIONS.md)** — Transparent GitHub token authentication for all stage `git` operations; `GIT_ASKPASS` mechanism; Jenkins credential config vs local `GITHUB_TOKEN` env var
 
 ## Local Execution
 

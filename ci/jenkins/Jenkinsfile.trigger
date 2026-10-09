@@ -1,0 +1,518 @@
+/*
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+/**
+ * Trigger Pipeline — Layer 1b CI orchestration for all trigger types.
+ *
+ * One instance of this job is generated per deployment by the seed job
+ * (seed_job_dsl.groovy), scoped to that deployment's trigger types and folder.
+ *
+ * Job Name pattern:
+ *   <pipelineBaseFolder>/<deployment.folder>/Triggers/Trigger_<type>
+ *
+ * Parameters (baked in at seed time — do not edit manually):
+ *   DEPLOYMENT_NAME          — deployment name from jenkins_job_config.json deployments[]
+ *   TRIGGER_TYPE             — trigger type stem, e.g. 'detect-ga-tag'
+ *   TRIGGER_VERSIONS_JSON    — JSON array of enabled version configs for this trigger type
+ *   PIPELINE_BASE_FOLDER     — Jenkins root folder under which all generated jobs live,
+ *                              e.g. "pipeline-sandbox". Empty string means Jenkins
+ *                              root. Used to reseed the correct deployment folder and to
+ *                              locate launch jobs at PIPELINE_BASE_FOLDER/<deployment>/
+ *                              Build_openjdk_launchers.
+ *   CONFIG_REPO_URL          — vendor config repo URL
+ *   CONFIG_REPO_BRANCH       — vendor config repo branch
+ *   CONFIG_REPO_CREDENTIALS_ID — Jenkins credential ID for config repo (optional)
+ *   DEFAULT_PARAMETERS_JSON  — JSON object of default parameters for this deployment
+ *                              (deployment.jobConfiguration.defaultParameters, baked in at seed time)
+ *
+ * Trigger Result JSON Interface Contract:
+ *   All trigger scripts must return a JSON result containing:
+ *     shouldTrigger  (boolean) — [REQUIRED] true if the trigger conditions are met (backward compatible with 'detected')
+ *     dedupBuildType (string)  — [REQUIRED] deduplication policy to apply. One of:
+ *                                  'NONE' — immediately trigger without Jenkins history checks
+ *                                  'NOT_ALREADY_BUILT' — perform Jenkins build history checks
+ *     scmRef         (string)  — [OPTIONAL] target SCM reference to build (branch or tag);
+ *                                  defaults to default branch HEAD. [REQUIRED when dedupBuildType is NOT_ALREADY_BUILT]
+ *     publishName    (string)  — [OPTIONAL] build/publish name override (passed as OVERRIDE_PUBLISH_NAME)
+ *     releaseType    (string)  — [OPTIONAL] RELEASE_TYPE, e.g. "WEEKLY" or "RELEASE" (defaults to "NIGHTLY")
+ */
+
+import groovy.json.JsonSlurper
+
+// ---------------------------------------------------------------------------
+// suppressTestingConditions evaluation
+// ---------------------------------------------------------------------------
+
+/**
+ * Return a UTC Calendar set to midnight (start-of-day) of the given calendar.
+ * Uses only sandbox-safe java.util.Calendar operations.
+ */
+Calendar _utcMidnight(Calendar cal) {
+    cal.set(Calendar.HOUR_OF_DAY, 0)
+    cal.set(Calendar.MINUTE, 0)
+    cal.set(Calendar.SECOND, 0)
+    cal.set(Calendar.MILLISECOND, 0)
+    return cal
+}
+
+/**
+ * Resolve a named window event to [windowStartMs, windowEndMs] epoch-millis pair.
+ *
+ * Built-in event names:
+ *   OPENJDK_RELEASE_DAY — the 3rd Tuesday of the current UTC month.
+ *
+ * Returns null if the event name is unrecognised (logs a warning; testing
+ * is NOT suppressed for unknown events to avoid accidentally blocking builds).
+ */
+List resolveEventWindow(String eventName, int daysBefore, int daysAfter) {
+    // Use Calendar (UTC) — fully sandbox-safe; java.time APIs are sandbox-blocked.
+    Calendar eventDay
+
+    switch (eventName) {
+        case 'OPENJDK_RELEASE_DAY':
+            // 3rd Tuesday of the current month
+            eventDay = Calendar.getInstance(TimeZone.getTimeZone('UTC'))
+            eventDay.set(Calendar.DAY_OF_MONTH, 1)
+            _utcMidnight(eventDay)
+            // Advance to first Tuesday, then add 14 days for the 3rd Tuesday
+            while (eventDay.get(Calendar.DAY_OF_WEEK) != Calendar.TUESDAY) {
+                eventDay.add(Calendar.DAY_OF_MONTH, 1)
+            }
+            eventDay.add(Calendar.DAY_OF_MONTH, 14)
+            break
+        default:
+            echo "⚠️  Unknown suppressTestingConditions event '${eventName}' — ignoring window, testing NOT suppressed"
+            return []
+    }
+
+    Calendar windowStart = eventDay.clone() as Calendar
+    windowStart.add(Calendar.DAY_OF_MONTH, -daysBefore)
+    _utcMidnight(windowStart)
+
+    Calendar windowEnd = eventDay.clone() as Calendar
+    windowEnd.add(Calendar.DAY_OF_MONTH, daysAfter + 1)
+    _utcMidnight(windowEnd)
+
+    echo "Event '${eventName}': ${eventDay.format('yyyy-MM-dd')} | Window: ${windowStart.format('yyyy-MM-dd')} to ${windowEnd.format('yyyy-MM-dd')} (exclusive) (daysBefore=${daysBefore}, daysAfter=${daysAfter})"
+    return [windowStart.getTimeInMillis(), windowEnd.getTimeInMillis()]
+}
+
+/**
+ * Evaluate whether testing should be suppressed for the given version config
+ * and effective build parameters.
+ *
+ * Reads suppressTestingConditions from versionConfig — an array of conditions
+ * that must ALL match for testing to be suppressed.  Each condition:
+ *   {
+ *     "param": "RELEASE_TYPE",    // parameter name to check in effectiveParams
+ *     "value": "WEEKLY",          // required value (supports "regex:" prefix)
+ *     "window": {                 // optional — condition only applies within this date window
+ *       "event":      "OPENJDK_RELEASE_DAY",
+ *       "daysBefore": 0,
+ *       "daysAfter":  7
+ *     }
+ *   }
+ *
+ * If suppressTestingConditions is absent or empty: testing is NOT suppressed.
+ * Returns true if testing should be suppressed, false otherwise.
+ */
+boolean shouldSuppressTesting(Map versionConfig, Map effectiveParams) {
+    List conditions = versionConfig.suppressTestingConditions ?: []
+    if (!conditions) { return false }
+
+    long nowMs = Calendar.getInstance(TimeZone.getTimeZone('UTC')).getTimeInMillis()
+
+    boolean allMatch = conditions.every { Map cond ->
+        // Check param value match
+        String actual   = effectiveParams[cond.param]?.toString() ?: ''
+        String expected = cond.value?.toString() ?: ''
+        boolean paramMatch
+        if (expected.startsWith('regex:')) {
+            paramMatch = actual =~ expected.substring('regex:'.length())
+        } else {
+            paramMatch = actual.equalsIgnoreCase(expected)
+        }
+        if (!paramMatch) { return false }
+
+        // If a window is specified, check whether today falls within it
+        Map window = cond.window
+        if (window) {
+            String eventName  = window.event    ?: ''
+            int daysBefore    = (window.daysBefore ?: 0) as int
+            int daysAfter     = (window.daysAfter  ?: 0) as int
+            List windowRange  = resolveEventWindow(eventName, daysBefore, daysAfter)
+            if (!windowRange) { return false }   // unknown event — don't suppress
+            long windowStart = windowRange[0] as long
+            long windowEnd   = windowRange[1] as long
+            boolean inWindow = nowMs >= windowStart && nowMs < windowEnd
+            Calendar nowCal = Calendar.getInstance(TimeZone.getTimeZone('UTC'))
+            echo "Window check: now=${nowCal.format('yyyy-MM-dd')} | inWindow=${inWindow}"
+            return inWindow
+        }
+
+        return true   // param matched, no window constraint
+    }
+
+    if (allMatch) {
+        echo "⚠️  suppressTestingConditions matched — disabling testing for this build"
+    }
+    return allMatch
+}
+
+// ---------------------------------------------------------------------------
+// Jenkins build history dedup
+// ---------------------------------------------------------------------------
+
+/**
+ * Query Jenkins build history for the given launch job to check whether a
+ * build with the given SCM_REF parameter already exists or is running.
+ *
+ * Returns one of: 'IN_PROGRESS', 'ALREADY_BUILT', 'NOT_FOUND'
+ *   IN_PROGRESS   — a build for this SCM_REF is currently running
+ *   ALREADY_BUILT — a completed build exists (any result: SUCCESS, UNSTABLE,
+ *                   FAILURE, ABORTED, etc.) — do not re-trigger
+ *   NOT_FOUND     — no build for this SCM_REF in history — safe to trigger
+ * Throws a pipeline error on any API failure — never fails open.
+ *
+ * Requires JENKINS_API_USER and JENKINS_API_TOKEN in the environment
+ * (injected via withCredentials by the caller).
+ */
+String checkExistingBuildForScmRef(String launchJobPath, String scmRef) {
+    String jobUrlSegment = launchJobPath.split('/').collect { "job/${it}" }.join('/')
+    String apiUrl = "${env.JENKINS_URL?.replaceAll('/+$', '')}/${jobUrlSegment}" +
+        '/api/json?tree=builds[number,building,result,actions[parameters[name,value]]]'
+
+    String response = ''
+    try {
+        response = sh(
+            script: """curl -gf --user "\${JENKINS_API_USER}:\${JENKINS_API_TOKEN}" '${apiUrl}'""",
+            returnStdout: true
+        ).trim()
+    } catch (Exception e) {
+        error "Jenkins API request failed for ${apiUrl}: ${e.message} — " +
+            "cannot safely determine dedup status, refusing to trigger."
+    }
+
+    if (!response) {
+        error "Jenkins API returned an empty response for ${apiUrl} — " +
+            "cannot safely determine dedup status, refusing to trigger."
+    }
+
+    List builds = new JsonSlurper().parseText(response).builds ?: []
+    for (Map build in builds) {
+        Map buildParams = [:]
+        (build.actions ?: []).each { Map action ->
+            (action.parameters ?: []).each { Map p -> buildParams[p.name] = p.value }
+        }
+        if (buildParams['SCM_REF'] == scmRef) {
+            String buildUrl = "${env.JENKINS_URL?.replaceAll('/+$', '')}/${jobUrlSegment}/${build.number}/"
+            if (build.building == true) {
+                echo "→ Found IN_PROGRESS build #${build.number} for SCM_REF=${scmRef}: ${buildUrl}"
+                return 'IN_PROGRESS'
+            }
+            if (build.building != true && build.result != null) {
+                echo "→ Found ALREADY_BUILT build #${build.number} (${build.result}) for SCM_REF=${scmRef}: ${buildUrl}"
+                return 'ALREADY_BUILT'
+            }
+        }
+    }
+    echo "→ No existing build for SCM_REF=${scmRef} on ${launchJobPath}"
+    return 'NOT_FOUND'
+}
+
+// ---------------------------------------------------------------------------
+// Launch job trigger
+// ---------------------------------------------------------------------------
+
+/**
+ * Trigger the launch job for the given version.
+ *
+ * Only per-run overrides are sent — the remaining parameters keep their
+ * baked-in defaults (set by the seed job) so the "Build with parameters"
+ * UI and the triggered-build sidebar both show the correct declared ordering
+ * and group separators.  Forwarding all deploymentDefaults as individual
+ * string/booleanParam values is intentionally avoided: it produces a flat,
+ * ungrouped sidebar on the triggered build because Jenkins renders the
+ * ParametersAction in the order params were passed, not the declared order.
+ *
+ * Per-run overrides sent:
+ *   GROUP_UID              — deterministic trigger-sourced identifier (see buildTriggerGroupId)
+ *   RELEASE_TYPE           — trigger-specific (WEEKLY / RELEASE)
+ *   PLATFORMS              — always "all" from a trigger
+ *   SCM_REF                — when provided by the trigger script
+ *   OVERRIDE_PUBLISH_NAME  — when provided by the trigger script
+ *   RUN_TESTS              — honours suppressTestingConditions evaluation
+ *
+ * @param launchJobBase      Jenkins path to the Build_openjdk_launchers folder
+ * @param jdkVersion         Version string, e.g. "jdk21"
+ * @param deploymentDefaults Merged default parameters for this deployment
+ * @param versionConfig      Version entry from trigger_config.json (for suppressTestingConditions)
+ * @param triggerResult      Parsed trigger-result.json Map from the trigger script
+ * @param releaseType        RELEASE_TYPE value to forward, e.g. "WEEKLY" or "RELEASE"
+ * @param triggerType        Trigger type stem, e.g. "detect-ga-tag"
+ */
+void triggerLaunchJob(String launchJobBase, String jdkVersion, Map deploymentDefaults,
+                      Map versionConfig, Map triggerResult, String releaseType,
+                      String triggerType) {
+    String vnum    = jdkVersion.replaceAll(/[^\d]/, '')
+    String jobPath = "${launchJobBase}/Build_openjdk${vnum}_launch"
+
+    // Evaluate suppressTestingConditions against the effective params for this run.
+    Map effectiveParams = [:] + deploymentDefaults
+    effectiveParams['RELEASE_TYPE'] = releaseType
+    boolean enableTesting = deploymentDefaults.getOrDefault('RUN_TESTS', true) as boolean
+    if (shouldSuppressTesting(versionConfig, effectiveParams)) {
+        enableTesting = false
+    }
+
+    // Build a deterministic, human-readable GROUP_UID that encodes the trigger
+    // source so any downstream build job can be traced back to its origin.
+    // See docs/TRIGGER_ARCHITECTURE.md §"GROUP_UID for trigger-launched builds".
+    String groupId = buildTriggerGroupId(triggerType, jdkVersion, triggerResult.scmRef as String)
+
+    // Send only the values that vary per trigger run.  All other parameters
+    // retain their baked-in defaults, preserving declared order and grouping.
+    List jobParams = [
+        string(name: 'GROUP_UID',    value: groupId),
+        string(name: 'RELEASE_TYPE', value: releaseType),
+        string(name: 'PLATFORMS',    value: 'all'),
+        booleanParam(name: 'RUN_TESTS', value: enableTesting),
+    ]
+    if (triggerResult.scmRef) {
+        jobParams << string(name: 'SCM_REF', value: triggerResult.scmRef as String)
+    }
+    if (triggerResult.publishName) {
+        jobParams << string(name: 'OVERRIDE_PUBLISH_NAME', value: triggerResult.publishName as String)
+    }
+
+    echo "Triggering ${jobPath} | GROUP_UID=${groupId} | SCM_REF=${triggerResult.scmRef ?: '(HEAD)'} | RELEASE_TYPE=${releaseType} | RUN_TESTS=${enableTesting}"
+    build(job: jobPath, parameters: jobParams, wait: false, propagate: false)
+    echo "✓ Triggered ${jobPath}"
+}
+
+/**
+ * Build a deterministic, human-readable GROUP_UID for a trigger-launched build.
+ *
+ * Format: trigger-<type-slug>-<version>-<scmRef-or-date>
+ *
+ *   type-slug    — triggerType with the leading "detect-" stripped and any
+ *                  non-alphanumeric/dot/plus/hyphen characters replaced by "-"
+ *   version      — JDK version string, e.g. "jdk21"
+ *   scmRef       — the scmRef from trigger-result.json when non-empty (e.g.
+ *                  "jdk-21.0.13+7_adopt"), otherwise the UTC date "yyyyMMdd"
+ *
+ * Examples:
+ *   detect-ga-tag + jdk21 + jdk-21.0.13+7_adopt  → trigger-ga-tag-jdk21-jdk-21.0.13+7_adopt
+ *   detect-build-tag-for-github-release + jdk28   → trigger-build-tag-jdk28-jdk-28+5_adopt
+ *   weekly-head + jdk27 + (no scmRef)             → trigger-weekly-head-jdk27-20250601
+ *
+ * Using a deterministic ID (rather than a random UUID) means that if the same
+ * tag is re-detected, the same GROUP_UID is produced — making it trivially
+ * de-duplicatable at the group level without any extra state.
+ *
+ * @param triggerType  Trigger type stem, e.g. "detect-ga-tag"
+ * @param jdkVersion   Version string, e.g. "jdk21"
+ * @param scmRef       SCM reference from trigger-result.json (may be null/empty)
+ * @return             Deterministic GROUP_UID string
+ */
+@NonCPS
+String buildTriggerGroupId(String triggerType, String jdkVersion, String scmRef) {
+    // Strip the redundant "detect-" prefix; sanitise remaining chars.
+    String typeSlug = triggerType
+        .replaceFirst(/^detect-/, '')
+        .replaceAll(/[^a-zA-Z0-9._+\-]/, '-')
+
+    // Use scmRef when available; fall back to today's UTC date for HEAD builds.
+    String refSlug = scmRef?.trim()
+        ? scmRef.trim().replaceAll(/[^a-zA-Z0-9._+\-]/, '-')
+        : new Date().format('yyyyMMdd', TimeZone.getTimeZone('UTC'))
+
+    return "trigger-${typeSlug}-${jdkVersion}-${refSlug}"
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline
+// ---------------------------------------------------------------------------
+
+pipeline {
+    agent none
+
+    // NOTE: The cron trigger schedule is baked in by the seed job for each
+    // trigger type — not defined here so it does not reset on every SCM checkout.
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        stage('Detect & Trigger') {
+            agent { label 'ci.role.worker' }
+            steps {
+                // Clean any leftovers from a previous aborted or failed run before
+                // the checkouts and trigger scripts write their output files.
+                // cleanWs() in post{always} handles the normal case; this guards
+                // the abnormal case (agent lost, build aborted mid-run) where the
+                // post block never ran and stale trigger-result.json files remain.
+                cleanWs()
+                script {
+                    checkout scm   // ci-adoptium-pipelines — for scripts/triggers/, scripts/lib/, job-dsl/
+
+                    dir('config-repo') {
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: "*/${params.CONFIG_REPO_BRANCH}"]],
+                            userRemoteConfigs: [[
+                                url: params.CONFIG_REPO_URL,
+                                credentialsId: params.CONFIG_REPO_CREDENTIALS_ID ?: ''
+                            ]]
+                        ])
+                    }
+
+                    // ── Reseed launch jobs ────────────────────────────────────────────
+                    // Re-run the seed DSL before firing any launch job to ensure every
+                    // launch job's parameter definitions match the config repo exactly.
+                    // This corrects any admin drift (e.g. a default value manually
+                    // changed in the Jenkins UI) before the trigger build is scheduled.
+                    // The config repo is always the source of truth — if a version has
+                    // been removed from activeJdkVersions its job is deleted here, just
+                    // as a scheduled seed run would do.
+                    echo "=== Reseeding launch jobs before trigger ==="
+                    def seedHelper = load('ci/jenkins/lib/SeedHelper.groovy')
+                    seedHelper.reseedForTrigger(
+                        params.CONFIG_REPO_URL,
+                        params.CONFIG_REPO_BRANCH,
+                        env.GIT_COMMIT,          // SHA of the pipeline repo checked out above
+                        params.PIPELINE_BASE_FOLDER ?: '',  // root folder — may be empty for Jenkins root
+                        params.DEPLOYMENT_NAME,  // restrict reseed to this deployment only
+                        params.PIPELINES_REPO_URL    ?: '',  // keep launch jobs on the same pipelines repo/branch
+                        params.PIPELINES_REPO_BRANCH ?: ''
+                    )
+                    echo "✓ Launch jobs reseeded"
+
+                    def credentialHelper = load('ci/jenkins/lib/CredentialHelper.groovy')
+                    def triggerRunner    = load('ci/jenkins/lib/TriggerScriptRunner.groovy')
+
+                    // Load vendor credential config and pass it to TriggerScriptRunner so
+                    // it can inject GITHUB_TOKEN (and any future env-var credential) using
+                    // the same CredentialHelper.withEnvVarCredential() logic as StageScriptRunner.
+                    if (fileExists('config-repo/jenkins_credential_config.json')) {
+                        Map credCfg = readJSON(file: 'config-repo/jenkins_credential_config.json')
+                        env.JENKINS_API_CREDENTIALS_ID = credCfg?.jenkinsApiCredentialsId ?: ''
+                        // Serialise the 'credentials' sub-map to a JSON string.
+                        // writeJSON (Pipeline Utility Steps) is sandbox-safe; JsonOutput is not.
+                        writeJSON file: 'trigger-cred-defs.tmp.json', json: (credCfg?.credentials ?: [:])
+                        String credDefsJson = readFile('trigger-cred-defs.tmp.json').trim()
+                        sh 'rm -f trigger-cred-defs.tmp.json'
+                        triggerRunner.setCredentialHelper(credentialHelper, credDefsJson)
+                    } else {
+                        triggerRunner.setCredentialHelper(credentialHelper)
+                    }
+
+                    List versions           = new JsonSlurper().parseText(params.TRIGGER_VERSIONS_JSON) as List
+                    Map  deploymentDefaults = new JsonSlurper().parseText(params.DEFAULT_PARAMETERS_JSON) as Map
+                    String triggerType      = params.TRIGGER_TYPE
+                    String deploymentBase   = params.PIPELINE_BASE_FOLDER?.trim()
+                        ? "${params.PIPELINE_BASE_FOLDER}/${params.DEPLOYMENT_NAME}"
+                        : params.DEPLOYMENT_NAME
+                    String launchJobBase    = "${deploymentBase}/Build_openjdk_launchers"
+
+                    echo "=== Trigger: ${triggerType} | Deployment: ${params.DEPLOYMENT_NAME} ==="
+                    echo "    Launch job base : ${launchJobBase}"
+                    echo "    Versions        : ${versions.findAll { it.enabled }.collect { it.version }.join(', ')}"
+
+                    Map triggerJobs = [:]
+                    versions.findAll { Map v -> v.enabled == true }.each { Map versionConfig ->
+                        String version = versionConfig.version
+                        triggerJobs[version] = {
+                            stage("${triggerType} — ${version}") {
+                                echo "Processing ${triggerType} for ${version}"
+
+                                Map result = triggerRunner.run(triggerType, versionConfig)
+
+                                boolean shouldTrigger = (result.shouldTrigger == true || result.detected == true)
+
+                                if (!shouldTrigger) {
+                                    echo "↷ ${version}: already published or no new tag detected — skipping"
+                                    return
+                                }
+
+                                String dedupBuildType = result.dedupBuildType as String
+                                if (!dedupBuildType) {
+                                    error "Trigger script result for '${triggerType}' did not return the required 'dedupBuildType' field. " +
+                                          "Please update the trigger script to return 'dedupBuildType' ('NONE' or 'NOT_ALREADY_BUILT') in trigger-result.json."
+                                }
+
+                                String releaseType = (result.releaseType as String ?: 'NIGHTLY').toUpperCase()
+
+                                if (dedupBuildType == 'NONE') {
+                                    triggerLaunchJob(launchJobBase, version, deploymentDefaults,
+                                        versionConfig, result, releaseType, triggerType)
+
+                                } else if (dedupBuildType == 'NOT_ALREADY_BUILT') {
+                                    String scmRef = result.scmRef as String
+                                    if (!scmRef) {
+                                        error "Trigger script for '${triggerType}' returned 'dedupBuildType' of 'NOT_ALREADY_BUILT' but 'scmRef' is empty or missing. " +
+                                              "An SCM reference is strictly required to perform deduplication checks."
+                                    }
+
+                                    String vnum      = version.replaceAll(/[^\d]/, '')
+                                    String launchJob = "${launchJobBase}/Build_openjdk${vnum}_launch"
+                                    String buildStatus = 'NOT_FOUND'
+
+                                    if (env.JENKINS_API_CREDENTIALS_ID?.trim()) {
+                                        withCredentials([
+                                            usernamePassword(
+                                                credentialsId: env.JENKINS_API_CREDENTIALS_ID,
+                                                usernameVariable: 'JENKINS_API_USER',
+                                                passwordVariable: 'JENKINS_API_TOKEN'
+                                            )
+                                        ]) {
+                                            buildStatus = checkExistingBuildForScmRef(launchJob, scmRef)
+                                        }
+                                    } else {
+                                        error "jenkinsApiCredentialsId is not configured in jenkins_credential_config.json — " +
+                                            "cannot perform dedup check for ${triggerType}. " +
+                                            "Set jenkinsApiCredentialsId to a Jenkins API token credential and re-run."
+                                    }
+
+                                    if (buildStatus == 'IN_PROGRESS') {
+                                        echo "↷ ${version}: build already in progress for ${scmRef} — skipping"
+                                    } else if (buildStatus == 'ALREADY_BUILT') {
+                                        echo "↷ ${version}: already built for ${scmRef} — skipping"
+                                    } else {
+                                        // NOT_FOUND — trigger
+                                        triggerLaunchJob(launchJobBase, version, deploymentDefaults,
+                                            versionConfig, result, releaseType, triggerType)
+                                    }
+                                } else {
+                                    error "Unknown dedupBuildType '${dedupBuildType}' returned in trigger-result.json"
+                                }
+                            }
+                        }
+                    }
+
+                    parallel triggerJobs
+                }
+            }
+            post { always { cleanWs() } }
+        }
+    }
+
+    post {
+        success  { echo '✓ Trigger pipeline completed' }
+        failure  { echo '✗ Trigger pipeline failed' }
+        unstable { echo '⚠ Trigger pipeline unstable' }
+    }
+}

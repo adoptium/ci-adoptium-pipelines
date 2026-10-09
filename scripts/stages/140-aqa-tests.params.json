@@ -1,0 +1,48 @@
+{
+  "stageId": "140-aqa-tests",
+  "stageDisabled": false,
+  "stageTimeoutMinutes": 30,
+  "stageCondition": [
+    { "param": "RUN_TESTS", "value": true }
+  ],
+  "stageInputArtifacts": [
+    "${BUILD_OUTPUT_DIR}/*.tar.gz",
+    "${BUILD_OUTPUT_DIR}/*.zip",
+    "${BUILD_OUTPUT_DIR}/*sbom*.json",
+    "build-metadata.json"
+  ],
+  "stageOutputArtifacts": ["**/*"],
+  "description": "Parameters for the AQA test stage. Triggers AQA_Test_Pipeline asynchronously with the archived JDK URL. Vendor overrides may suppress, replace, or extend these via a vendor-scripts/140-aqa-tests.params.json in the config repo.",
+  "parameterGroups": [
+    {
+      "name": "Stage Selections",
+      "description": "Boolean flags that control which pipeline stages are enabled. All stage-gate parameters are collected here so operators can see and adjust the full execution plan in one place.",
+      "parameters": [
+        {
+          "name": "RUN_TESTS",
+          "type": "boolean",
+          "default": true,
+          "description": "Enable test stages."
+        }
+      ]
+    },
+    {
+      "name": "Source Control",
+      "description": "Refs that pin exactly what source is checked out for this stage. Leave empty to use the defaults defined in adoptium_pipeline_config.json.",
+      "parameters": [
+        {
+          "name": "AQA_REF",
+          "type": "string",
+          "default": "",
+          "description": "Git branch or tag for the aqa-tests repository. Empty = default branch defined in adoptium_pipeline_config.json."
+        },
+        {
+          "name": "BUILD_REF",
+          "type": "string",
+          "default": "",
+          "description": "Git branch or tag for the build-scripts repository. Empty = default defined in adoptium_pipeline_config.json."
+        }
+      ]
+    }
+  ]
+}

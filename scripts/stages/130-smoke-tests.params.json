@@ -1,0 +1,16 @@
+{
+  "stageId": "130-smoke-tests",
+  "stageDisabled": false,
+  "stageTimeoutMinutes": 0,
+  "stageInputArtifacts": [
+    "${BUILD_OUTPUT_DIR}/*.tar.gz",
+    "${BUILD_OUTPUT_DIR}/*.zip"
+  ],
+  "stageOutputArtifacts": [
+    "*.txt",
+    "test-results/**/*",
+    "smoke-test-summary.json"
+  ],
+  "description": "Smoke-tests stage params. Runs unconditionally.",
+  "parameterGroups": []
+}

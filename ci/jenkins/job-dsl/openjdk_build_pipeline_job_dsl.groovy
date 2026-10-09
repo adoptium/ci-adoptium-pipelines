@@ -34,13 +34,11 @@ limitations under the License.
  *                           launch job workspace (env.GIT_COMMIT from Jenkinsfile.launch).
  *                           Used to detect when the build job was generated from a
  *                           different commit and must be regenerated.
+ *   PIPELINE_BASE_FOLDER  — (optional) Jenkins folder path prefix for the generated
+ *                           build job (e.g. "MyOrg/OpenJDK").  Supplied by Jenkinsfile.launch
+ *                           from the baked-in PIPELINE_BASE_FOLDER job parameter.
  *
- * jenkins_job_config.json fields consumed here:
- *   pipelineBaseFolder    — (optional) Jenkins folder path prefix for the generated
- *                           build job (e.g. "MyOrg/OpenJDK").  Must match what the
- *                           seed job used.  Omit or set to "" for the Jenkins root.
- *
- * Creates: [pipelineBaseFolder/]Build_openjdk/Build_openjdk<version>_<distro>_<arch>_<os>
+ * Creates: [PIPELINE_BASE_FOLDER/]Build_openjdk/Build_openjdk<version>_<distro>_<arch>_<os>
  *
  * Regeneration logic (automatic — no manual parameter needed):
  *   The generated job's description embeds the SHA it was created from as
@@ -57,12 +55,20 @@ import jenkins.model.Jenkins
 // STEP 1: Validate binding variables
 // ============================================================================
 
-def jdkVersion         = binding.variables.get('JDK_VERSION')
-def platform           = binding.variables.get('PLATFORM')
-def collatedParamsJson = binding.variables.get('COLLATED_PARAMS_JSON') ?: ''
-def pipelineCommitSha  = binding.variables.get('PIPELINE_COMMIT_SHA')  ?: 'unknown'
-def configRepoUrl      = binding.variables.get('CONFIG_REPO_URL')       ?: ''
-def configRepoBranch   = binding.variables.get('CONFIG_REPO_BRANCH')    ?: ''
+def jdkVersion              = binding.variables.get('JDK_VERSION')
+def platform                = binding.variables.get('PLATFORM')
+def collatedParamsJson      = binding.variables.get('COLLATED_PARAMS_JSON')       ?: ''
+def pipelineCommitSha       = binding.variables.get('PIPELINE_COMMIT_SHA')        ?: 'unknown'
+def configRepoUrl           = binding.variables.get('CONFIG_REPO_URL')            ?: ''
+def configRepoBranch        = binding.variables.get('CONFIG_REPO_BRANCH')         ?: ''
+def configRepoCredentialsId = binding.variables.get('CONFIG_REPO_CREDENTIALS_ID') ?: ''
+def configDeploymentName    = binding.variables.get('CONFIG_DEPLOYMENT_NAME')     ?: ''
+def pipelineBaseFolder      = (binding.variables.get('PIPELINE_BASE_FOLDER') ?: '').toString().trim().replaceAll(/\/+$/, '')
+// PIPELINES_REPO_URL / PIPELINES_REPO_BRANCH: forwarded from Jenkinsfile.launch when
+// the development seed job overrides the pipeline fork.  Empty string → use the
+// values from adoptium_pipeline_config.json (production default).
+def pipelinesRepoUrlOverride    = (binding.variables.get('PIPELINES_REPO_URL')    ?: '').toString().trim()
+def pipelinesRepoBranchOverride = (binding.variables.get('PIPELINES_REPO_BRANCH') ?: '').toString().trim()
 
 final int SEPARATOR_WIDTH = 80
 final int DUPLICATE_ZERO  = 0
@@ -78,11 +84,12 @@ if (!collatedParamsJson?.trim()) {
 
 println '=' * SEPARATOR_WIDTH
 println 'openjdk_build_pipeline'
-println "  JDK_VERSION         : ${jdkVersion}"
-println "  PLATFORM            : ${platform}"
-println "  PIPELINE_COMMIT_SHA : ${pipelineCommitSha}"
-println "  CONFIG_REPO_URL     : ${configRepoUrl}"
-println "  CONFIG_REPO_BRANCH  : ${configRepoBranch}"
+println "  JDK_VERSION          : ${jdkVersion}"
+println "  PLATFORM             : ${platform}"
+println "  PIPELINE_COMMIT_SHA  : ${pipelineCommitSha}"
+println "  CONFIG_REPO_URL      : ${configRepoUrl}"
+println "  CONFIG_REPO_BRANCH   : ${configRepoBranch}"
+println "  PIPELINE_BASE_FOLDER : ${pipelineBaseFolder ?: '(root)'}"
 println '=' * SEPARATOR_WIDTH
 
 // ============================================================================
@@ -97,10 +104,16 @@ println '✓ Loaded adoptium_pipeline_config.json'
 def jenkinsConfig = slurper.parseText(readFileFromWorkspace('config-repo/jenkins_job_config.json'))
 println '✓ Loaded jenkins_job_config.json'
 
-// Read optional base folder — must match what the seed job used.
-def pipelineBaseFolder = (jenkinsConfig?.pipelineBaseFolder ?: '').toString().trim().replaceAll(/\/+$/, '')
+// jenkins_credential_config.json is optional — absent when no credentials (e.g. for private repos or authenticated GitHub API access) are needed.
+def credentialConfig = [:]
+try {
+    credentialConfig = slurper.parseText(readFileFromWorkspace('config-repo/jenkins_credential_config.json'))
+    println '✓ Loaded jenkins_credential_config.json'
+} catch (Exception e) {
+    println 'ℹ️  jenkins_credential_config.json not found — no SCM credentials configured'
+}
+
 def inFolder = { String name -> pipelineBaseFolder ? "${pipelineBaseFolder}/${name}" : name }
-println "  pipelineBaseFolder : ${pipelineBaseFolder ?: '(root)'}"
 
 def jdkConfig = slurper.parseText(readFileFromWorkspace("config-repo/configurations/jdk${jdkVersion}_pipeline_config.json"))
 
@@ -120,7 +133,18 @@ if (!architecture || !targetOs) {
 }
 println "✓ Platform: arch=${architecture}, os=${targetOs}, variant=${variant}"
 
-def defaultParams = jenkinsConfig?.jobConfiguration?.defaultParameters
+// Resolve the jobConfiguration for this deployment.
+// CONFIG_DEPLOYMENT_NAME is baked into the launch job by the seed and forwarded here.
+// Falls back to the first deployment's jobConfiguration when absent (e.g. legacy seed runs).
+def deploymentJobConfig = {
+    List deps = jenkinsConfig.deployments ?: []
+    Map dep = configDeploymentName
+        ? deps.find { it.name == configDeploymentName }
+        : deps.find { it.jobConfiguration }
+    return dep?.jobConfiguration ?: [:]
+}()
+
+def defaultParams = deploymentJobConfig.defaultParameters ?: [:]
 
 // ============================================================================
 // STEP 3: Build collated param groups from pre-computed JSON.
@@ -161,16 +185,18 @@ println "✓ Received ${rawGroups.size()} raw group(s), merged to ${collatedPara
 
 // Job DSL scripts run on the Jenkins controller in a trusted (non-sandboxed)
 // context, so Jenkins.instance is available without script approval.
-def jobName     = "/${inFolder("Build_openjdk/Build_openjdk${jdkVersion}_${variant}_${architecture}_${targetOs}")}"
-def existingJob = Jenkins.instance.getItemByFullName(jobName)
-def storedSha   = (existingJob?.description ?: '') =~ /pipeline-sha:([0-9a-f]+)/
+def jobName      = "/${inFolder("Build_openjdk/Build_openjdk${jdkVersion}_${variant}_${architecture}_${targetOs}")}"
+def lookupName   = jobName.replaceAll(/^\//, '')
+def existingJob  = Jenkins.instance.getItemByFullName(lookupName)
+def shaMatch     = (existingJob?.description ?: '') =~ /pipeline-sha:([0-9a-f]+)/
+def storedShaVal = shaMatch.find() ? shaMatch.group(1) : null
 
 if (existingJob == null) {
     println '  → Job does not exist yet — will create'
-} else if (!storedSha || storedSha[DUPLICATE_ZERO][1] != pipelineCommitSha) {
-    println "  → Stored pipeline-sha (${storedSha ? storedSha[DUPLICATE_ZERO][1] : 'none'}) differs from current (${pipelineCommitSha}) — will regenerate"
+} else if (storedShaVal != pipelineCommitSha) {
+    println "  → Stored pipeline-sha (${storedShaVal ?: 'none'}) differs from current (${pipelineCommitSha}) — will regenerate"
 } else {
-    println "  → Job is up-to-date (pipeline-sha: ${storedSha[DUPLICATE_ZERO][1]}) — skipping regeneration"
+    println "  → Job is up-to-date (pipeline-sha: ${storedShaVal}) — skipping regeneration"
     return
 }
 
@@ -220,8 +246,14 @@ pipelineJob(jobName.replaceAll(/^\//, '')) {
             description('Target CPU architecture — fixed at job-generation time')
             trim(true)
         }
+        // Honour defaultParams.RELEASE_TYPE by placing the configured default first.
+        def allReleaseTypes    = ['NIGHTLY', 'WEEKLY', 'RELEASE']
+        def releaseTypeDefault = defaultParams?.RELEASE_TYPE?.toString()?.trim()
+        def releaseTypeChoices = releaseTypeDefault && allReleaseTypes.contains(releaseTypeDefault)
+            ? ([releaseTypeDefault] + allReleaseTypes.findAll { it != releaseTypeDefault })
+            : allReleaseTypes
         choiceParam('RELEASE_TYPE',
-            ['NIGHTLY', 'WEEKLY', 'RELEASE'],
+            releaseTypeChoices,
             'Type of release build')
         stringParam {
             name('GROUP_UID')
@@ -298,6 +330,12 @@ pipelineJob(jobName.replaceAll(/^\//, '')) {
             description('Vendor config repo branch — baked in at job-generation time')
             trim(true)
         }
+        stringParam {
+            name('CONFIG_REPO_CREDENTIALS_ID')
+            defaultValue(configRepoCredentialsId)
+            description('Jenkins credential ID for the vendor config repo — baked in at job-generation time. Recommended even for public repos to avoid GitHub rate-limiting on unauthenticated git access.')
+            trim(true)
+        }
     }
 
     definition {
@@ -305,12 +343,12 @@ pipelineJob(jobName.replaceAll(/^\//, '')) {
             scm {
                 git {
                     remote {
-                        url(pipelineConfig.repository.url)
-                        if (pipelineConfig.repository.credentialsId) {
-                            credentials(pipelineConfig.repository.credentialsId)
+                        url(pipelinesRepoUrlOverride    ?: pipelineConfig.repository.url)
+                        if (credentialConfig.pipelineRepoCredentialsId) {
+                            credentials(credentialConfig.pipelineRepoCredentialsId)
                         }
                     }
-                    branch("*/${pipelineConfig.repository.branch}")
+                    branch("*/${pipelinesRepoBranchOverride ?: pipelineConfig.repository.branch}")
                     extensions {
                         cleanBeforeCheckout()
                     }
@@ -325,10 +363,11 @@ pipelineJob(jobName.replaceAll(/^\//, '')) {
         buildDiscarder {
             strategy {
                 logRotator {
-                    daysToKeepStr(jenkinsConfig.jobConfiguration.logRotation.daysToKeep.toString())
-                    numToKeepStr(jenkinsConfig.jobConfiguration.logRotation.numToKeep.toString())
-                    artifactDaysToKeepStr(jenkinsConfig.jobConfiguration.logRotation.artifactDaysToKeep.toString())
-                    artifactNumToKeepStr(jenkinsConfig.jobConfiguration.logRotation.artifactNumToKeep.toString())
+                    def lr = deploymentJobConfig.logRotation ?: [:]
+                    daysToKeepStr((lr.daysToKeep ?: 30).toString())
+                    numToKeepStr((lr.numToKeep ?: 50).toString())
+                    artifactDaysToKeepStr((lr.artifactDaysToKeep ?: 7).toString())
+                    artifactNumToKeepStr((lr.artifactNumToKeep ?: 10).toString())
                 }
             }
         }

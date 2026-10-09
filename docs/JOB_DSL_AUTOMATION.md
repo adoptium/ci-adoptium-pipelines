@@ -49,7 +49,7 @@ openjdk-build-seed-job  (Pipeline job — Pipeline from SCM → config repo Jenk
          reads pipelines/scripts/stages/       (default stage params)
          reads vendor-scripts/                 (vendor stage param overrides)
          creates Build_openjdk_launchers/ folder + one launch job per JDK version
-         creates Build_openjdk/ folder + Jenkins views
+         creates Build_openjdk/ folder + Jenkins views for each enabled JDK version
 
 Build_openjdk_launchers/Build_openjdk21_launch  (Pipeline — Jenkinsfile.launch)
   stage('Initialize'):
@@ -77,33 +77,31 @@ from this repository into the **root of your vendor config repository** (or any 
   adoptium_pipeline_config.json
   jenkins_job_config.json
   vendor-scripts/
-    02-build.params.json
+    020-build.params.json
     ...
 ```
 
-Open the file and adjust the two constants at the top if needed:
-
-```groovy
-def PIPELINES_REPO_URL    = 'https://github.com/adoptium/ci-adoptium-pipelines.git'
-def PIPELINES_REPO_BRANCH = 'main'
-```
-
-For a fork or a pinned branch, change these values. Commit and push.
+The default pipeline repository URL and branch are read from `repository.url` and
+`repository.branch` in `adoptium_pipeline_config.json`. No changes to `Jenkinsfile.seed`
+are needed for a standard production setup.
 
 ### Step 2: Create the Pipeline seed job in Jenkins
 
 1. In Jenkins, create a new **Pipeline** job named `openjdk-build-seed-job`
 
-1. **Add Parameters** — click *This project is parameterized* and add two String Parameters **in the Jenkins job configuration UI**:
+1. **Add Parameters** — click *This project is parameterized* and add the following String Parameters **in the Jenkins job configuration UI**:
 
-   | Name | Default | Description |
-   |---|---|---|
-   | `CONFIG_REPO_URL` | *(your config repository URL)* | URL of your vendor config repository — **REQUIRED** |
-   | `CONFIG_REPO_BRANCH` | `main` | Branch of your vendor config repository |
+   | Name | Required | Default | Description |
+   |---|---|---|---|
+   | `CONFIG_REPO_URL` | ✅ required | *(your config repository URL)* | URL of your vendor config repository |
+   | `CONFIG_REPO_BRANCH` | ✅ required | `main` | Branch of your vendor config repository |
+   | `PIPELINE_BASE_FOLDER` | development only | *(leave blank)* | Override the Jenkins folder under which all jobs are placed — see [Development Fork Workflow](#development-fork-workflow) |
+   | `PIPELINES_REPO_URL` | development only | *(leave blank)* | Override the `ci-adoptium-pipelines` repository URL — see [Development Fork Workflow](#development-fork-workflow) |
+   | `PIPELINES_REPO_BRANCH` | development only | *(leave blank)* | Override the `ci-adoptium-pipelines` branch — see [Development Fork Workflow](#development-fork-workflow) |
 
    > **Important**: do not declare these in `Jenkinsfile.seed`. A `parameters {}` block in a Jenkinsfile causes Jenkins to reset values to the Jenkinsfile defaults on every run, wiping whatever the operator set.
-
-   These values are baked into every generated launch job so `Jenkinsfile.launch` can check out the config repository at runtime on each build agent.
+   >
+   > **Production jobs**: leave `PIPELINE_BASE_FOLDER`, `PIPELINES_REPO_URL`, and `PIPELINES_REPO_BRANCH` absent or blank. The production folder comes from `jenkins_job_config.json`; the pipeline repo comes from `adoptium_pipeline_config.json`.
 
 1. Under **Pipeline**:
    - **Definition**: `Pipeline script from SCM`
@@ -113,6 +111,16 @@ For a fork or a pinned branch, change these values. Commit and push.
    - **Branch Specifier**: your config repository branch (e.g. `main`)
    - **Script Path**: `Jenkinsfile.seed` *(or the path you chose in Step 1)*
 
+1. Under **Build Triggers**, enable automatic runs so the generated jobs stay in step with the vendor config repository:
+   - **GitHub hook trigger for GITScm polling** — the seed job runs as soon as GitHub delivers a push event for the config repository. Requires a GitHub webhook on the config repository pointing at `https://<your-jenkins>/github-webhook/` (content type `application/json`, *push* events).
+   - **Poll SCM** — Jenkins polls the config repository on a schedule (e.g. `H/15 * * * *`). Use this as a fallback if webhooks cannot reach Jenkins, or alongside the hook as a safety net for missed deliveries.
+
+   > **Parameters**: triggered runs use the *default* values of the job parameters. Set the defaults of `CONFIG_REPO_URL` and `CONFIG_REPO_BRANCH` (Step 2, *Add Parameters*) to your production values, otherwise triggered runs fail with "CONFIG_REPO_URL is required".
+   >
+   > **Scope**: the triggers watch the repository and branch configured under **Pipeline → SCM**, i.e. the vendor config repository. Changes to `ci-adoptium-pipelines` are not watched; see [Maintenance](#re-running-the-seed-job).
+   >
+   > **Development seed jobs**: do not enable these triggers on the development seed job — run it manually.
+
 1. Save the job.
 
 > **Note**: The Pipeline SCM step checks out the vendor config repository to the workspace
@@ -120,6 +128,10 @@ For a fork or a pinned branch, change these values. Commit and push.
 > `configurations/`, and `vendor-scripts/` are all immediately available to the Job
 > DSL script without any additional checkout steps. Credentials are handled natively
 > by the Git plugin using the Jenkins Credentials store.
+>
+> **Multiple deployments**: the folder layout and security boundaries are defined
+> in `jenkins_job_config.json` via `pipelineBaseFolder` and `deployments[]`. A
+> single seed run generates all deployments. See [Deployments](#deployments) below.
 
 ### Step 3: Run the seed job
 
@@ -133,14 +145,34 @@ The job will:
 - Check out `ci-adoptium-pipelines` into `pipelines/`
 - Collate stage parameters from `pipelines/scripts/stages/` and `vendor-scripts/`
 - Read `adoptium_pipeline_config.json` and `jenkins_job_config.json` from the config repository
-- Create the `Build_openjdk_launchers/` and `Build_openjdk/` folders
+- Read `trigger_config.json` if present
+- Create one set of folders per deployment under `pipelineBaseFolder`
 - Create one launch job per enabled JDK version under `Build_openjdk_launchers/`
-- Create `Build_openjdk_launchers` and `Build_openjdk` Jenkins views
+- Create a Jenkins view for each enabled JDK version
 
 ### Step 4: Create Platform Build Jobs
 
 Simply run a launch job (e.g. `Build_openjdk_launchers/Build_openjdk21_launch`).
 Platform jobs are created automatically — no extra flag is needed.
+
+> **Launch jobs keep the platform build jobs up to date.** On every run, before any
+> build is triggered, the launch job's `Create/Update Platform Jobs` stage creates
+> each selected platform build job (`Build_openjdk/...`) if it does not already exist.
+> It also regenerates the job if the `ci-adoptium-pipelines` repository has been
+> updated since the job was last generated. It detects this by comparing the
+> `pipeline-sha:<sha>` recorded in the build job's description with the SHA of the
+> `ci-adoptium-pipelines` commit the launch job checked out. If the SHAs match, the
+> job is left untouched. You therefore never need to create or update platform build
+> jobs by hand. The launch jobs themselves are only regenerated by the seed job (see
+> check 1 below).
+>
+> The description of a generated platform build job looks like this, with the SHA on
+> the last line being the one compared:
+>
+> ```text
+> Platform-specific build pipeline for OpenJDK 11 (temurin) on x64/linux.
+> pipeline-sha:9f245bb070263a8df69d82a1bf75653de0e4784b
+> ```
 
 Each launch run performs two SHA-based staleness checks:
 
@@ -207,29 +239,123 @@ params to platform builds automatically.
 
 ### Job Parameters
 
-Default parameter values come from `jenkins_job_config.json` in the config repository:
+Default parameter values are declared per-deployment inside `jenkins_job_config.json`.
+Each deployment carries its own complete `jobConfiguration` — there is no shared base
+with per-deployment overrides; every deployment is fully self-contained.
 
 ```json
 {
-  "pipelineTimeoutHours": 8,
-  "jobConfiguration": {
-    "defaultParameters": {
-      "RUN_TESTS": false,
-      "ENABLE_INSTALLERS": true,
-      "SIGN_ARTIFACTS": false,
-      "PUBLISH_ARTIFACTS": false,
-      "RUN_REPRODUCIBLE_COMPARE": false,
-      "CLEAN_WORKSPACE_AFTER_STAGE": true
-    },
-    "logRotation": {
-      "daysToKeep": 30,
-      "numToKeep": 50,
-      "artifactDaysToKeep": 7,
-      "artifactNumToKeep": 10
+  "pipelineBaseFolder": "temurin",
+  "deployments": [
+    {
+      "name": "release",
+      "folder": "release",
+      "jobConfiguration": {
+        "defaultParameters": {
+          "RUN_TESTS": true,
+          "ENABLE_INSTALLERS": true,
+          "SIGN_ARTIFACTS": true,
+          "PUBLISH_ARTIFACTS": true,
+          "RUN_REPRODUCIBLE_COMPARE": false,
+          "CLEAN_WORKSPACE_AFTER_STAGE": true,
+          "RELEASE_TYPE": "RELEASE"
+        },
+        "logRotation": {
+          "daysToKeep": 30,
+          "numToKeep": 50,
+          "artifactDaysToKeep": 7,
+          "artifactNumToKeep": 10
+        }
+      }
     }
-  }
+  ]
 }
 ```
+
+## Deployments
+
+Deployments define independent Jenkins folder namespaces for the pipeline — each
+with its own set of launch jobs, build jobs, trigger jobs, and security boundary.
+
+Declare deployments in `jenkins_job_config.json`:
+
+```json
+{
+  "pipelineBaseFolder": "temurin",
+  "deployments": [
+    {
+      "name": "release",
+      "folder": "release",
+      "description": "Production release pipeline — restricted access",
+      "jobConfiguration": {
+        "defaultParameters": {
+          "RELEASE_TYPE": "RELEASE",
+          "PUBLISH_ARTIFACTS": true,
+          "SIGN_ARTIFACTS": true,
+          "RUN_TESTS": true,
+          "CLEAN_WORKSPACE_AFTER_STAGE": true
+        },
+        "logRotation": {
+          "daysToKeep": 30,
+          "numToKeep": 50,
+          "artifactDaysToKeep": 7,
+          "artifactNumToKeep": 10
+        }
+      },
+      "triggers": ["detect-ga-tag"]
+    },
+    {
+      "name": "beta",
+      "folder": "beta",
+      "description": "EA/beta and weekly HEAD builds",
+      "jobConfiguration": {
+        "defaultParameters": {
+          "RELEASE_TYPE": "WEEKLY",
+          "PUBLISH_ARTIFACTS": true,
+          "SIGN_ARTIFACTS": true,
+          "RUN_TESTS": true,
+          "RUN_REPRODUCIBLE_COMPARE": true,
+          "CLEAN_WORKSPACE_AFTER_STAGE": true
+        },
+        "logRotation": {
+          "daysToKeep": 14,
+          "numToKeep": 30,
+          "artifactDaysToKeep": 7,
+          "artifactNumToKeep": 5
+        }
+      },
+      "triggers": ["detect-build-tag-for-github-release", "weekly-head"]
+    }
+  ]
+}
+```
+
+The effective folder for each deployment is `pipelineBaseFolder/deployment.folder`:
+
+```text
+Jenkins root
+└── temurin/
+    ├── release/
+    │   ├── Build_openjdk_launchers/   — launch jobs
+    │   ├── Build_openjdk/             — platform build jobs (lazy-created)
+    │   └── Triggers/
+    │       └── Trigger_detect-ga-tag  — daily cron (secure to release team)
+    └── beta/
+        ├── Build_openjdk_launchers/
+        ├── Build_openjdk/
+        └── Triggers/
+            ├── Trigger_detect-build-tag-for-github-release  — daily cron
+            └── Trigger_weekly-head                          — weekly cron
+```
+
+Each deployment owns its full `jobConfiguration` — default parameters and log
+rotation are set independently per deployment, so `release` and `beta` can have
+different retention policies, publish flags, and release types without any merging.
+
+Apply Jenkins folder-level security to `temurin/release/` after the first seed
+run to restrict access to the release deployment.
+
+For automated trigger configuration, see [`docs/TRIGGER_ARCHITECTURE.md`](./TRIGGER_ARCHITECTURE.md).
 
 ## Maintenance
 
@@ -243,6 +369,8 @@ Run the seed job any time to pick up changes to:
 - Job DSL script changes (`ci/jenkins/job-dsl/`)
 
 The config repository is re-checked out by the Pipeline SCM step; `pipelines/` (ci-adoptium-pipelines) is re-checked out by the explicit `git` step in `Jenkinsfile.seed`.
+
+If the seed job has **GitHub hook trigger for GITScm polling** and/or **Poll SCM** enabled (see [Step 2](#step-2-create-the-pipeline-seed-job-in-jenkins)), it re-runs automatically on every push to the config repository branch, so config-only changes need no manual run. Changes in `ci-adoptium-pipelines` (e.g. Job DSL scripts or `*.params.json`) do not trigger it; run the seed job manually after those.
 
 ### Adding/Removing JDK Versions
 
@@ -271,14 +399,91 @@ Changes to `Jenkinsfile` files or stage scripts in `ci-adoptium-pipelines` take 
 
 ### Pinning to a specific pipeline repository version
 
-Edit the constants in your `Jenkinsfile.seed`:
+Set `repository.url` and `repository.branch` in `adoptium_pipeline_config.json` in your config repository:
 
-```groovy
-def PIPELINES_REPO_URL    = 'https://github.com/adoptium/ci-adoptium-pipelines.git'
-def PIPELINES_REPO_BRANCH = 'v2.1.0'   // pin to a tag or branch
+```json
+{
+  "repository": {
+    "url": "https://github.com/adoptium/ci-adoptium-pipelines.git",
+    "branch": "v2.1.0"
+  }
+}
 ```
 
-Commit and push, then re-run the seed job.
+Commit and push to your config repository, then re-run the seed job. The new URL and branch are baked into all generated launch and platform build jobs automatically.
+
+---
+
+## Development Fork Workflow
+
+When developing changes to `ci-adoptium-pipelines` itself you need to test against
+your own fork without touching the production Jenkins jobs. The seed job supports
+three optional override parameters that together let you do this entirely through
+the Jenkins UI — no config file edits or revert commits required.
+
+### How it works
+
+The three parameters form a chain that propagates your fork URL/branch all the way
+down to every generated job:
+
+```text
+Seed job parameters
+  PIPELINES_REPO_URL    → checkout your fork into pipelines/
+  PIPELINES_REPO_BRANCH → baked into every generated launch job SCM definition
+  PIPELINE_BASE_FOLDER  → all generated jobs land in a sandbox folder
+
+Launch job (generated)
+  PIPELINES_REPO_URL/BRANCH baked as job params
+    → forwarded to openjdk_build_pipeline_job_dsl.groovy
+      → baked into every generated platform build job SCM definition
+```
+
+### Setup: create a development seed job
+
+Create a **second** seed job (e.g. `openjdk-build-seed-job-dev`) pointing at the
+same `Jenkinsfile.seed`. In the Jenkins job configuration UI add **all five**
+String Parameters:
+
+| Parameter | Example value | Purpose |
+|---|---|---|
+| `CONFIG_REPO_URL` | `https://github.com/my-org/temurin-config.git` | Your config repository (can be same as production) |
+| `CONFIG_REPO_BRANCH` | `my-feature-branch` | Your config repository branch |
+| `PIPELINE_BASE_FOLDER` | `my-sandbox/dev` | Sandbox folder — **must differ from the production folder** |
+| `PIPELINES_REPO_URL` | `https://github.com/my-org/ci-adoptium-pipelines.git` | Your pipeline repository fork |
+| `PIPELINES_REPO_BRANCH` | `my-feature-branch` | Your pipeline fork branch |
+
+> **Safety guard**: `PIPELINE_BASE_FOLDER` is validated at runtime. If it is
+> blank, or matches the production folder defined in `jenkins_job_config.json`,
+> the seed job fails immediately. This prevents accidentally overwriting production
+> jobs with a fork build.
+
+### Running the development seed
+
+1. Click **Build with Parameters** on `openjdk-build-seed-job-dev`
+1. Fill in all five parameters
+1. Click **Build**
+
+The seed job will:
+
+- Check out your config repository fork/branch
+- Check out your pipeline repository fork/branch into `pipelines/`
+- Generate all launch and platform build jobs under `PIPELINE_BASE_FOLDER`
+- Bake `PIPELINES_REPO_URL` and `PIPELINES_REPO_BRANCH` into each generated
+  launch job as parameters **and** as its Pipeline SCM definition
+
+### What gets baked in
+
+After the seed run:
+
+- Each **launch job**'s Pipeline SCM definition points at your fork/branch, so
+  `Jenkinsfile.launch` is fetched from your fork on every run
+- Each **launch job** carries `PIPELINES_REPO_URL` and `PIPELINES_REPO_BRANCH`
+  as visible job parameters — these are forwarded to the `openjdk_build_pipeline_job_dsl`
+  step when platform build jobs are created/updated
+- Each **platform build job**'s Pipeline SCM definition points at your fork/branch,
+  so `Jenkinsfile.declarative` is fetched from your fork on every run
+
+The production jobs under the production folder are completely untouched.
 
 ## Troubleshooting
 
@@ -287,6 +492,12 @@ Commit and push, then re-run the seed job.
 **Cause**: Seed job run without parameters.
 
 **Fix**: Use **Build with Parameters** and supply `CONFIG_REPO_URL` and `CONFIG_REPO_BRANCH`.
+
+### Config Repository Checkout Fails with Authentication Error
+
+**Cause**: The vendor config repository is private but no credential is configured.
+
+**Fix**: Set `configRepoCredentialsId` in `jenkins_credential_config.json` in your config repository and re-run the seed job. The credential ID is baked into every generated launch and platform build job automatically.
 
 ### Seed Job Fails with "vendor-scripts/ not found"
 

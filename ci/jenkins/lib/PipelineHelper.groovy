@@ -39,19 +39,45 @@ limitations under the License.
 buildUidHelper = null // Lazy-loaded by initializeStage(); explicit null initialises the Binding entry
 
 /**
- * Execute a stage body with automatic result tracking via BuildUidHelper.
+ * Return configured stage timeout in minutes from env.COLLATED_STAGE_TIMEOUTS, or 0 if none.
+ */
+int getStageTimeout(String stageName) {
+    String timeoutJson = env.COLLATED_STAGE_TIMEOUTS
+    if (!timeoutJson) { return 0 }
+    try {
+        Map timeoutMap = new groovy.json.JsonSlurper().parseText(timeoutJson)
+        return (timeoutMap[stageName] ?: 0) as int
+    } catch (Exception e) {
+        return 0
+    }
+}
+
+/**
+ * Execute a stage body with automatic result tracking via BuildUidHelper and optional timeout.
  */
 void executeStageWithTracking(String stageName, Closure body) {
-    try {
-        body()
-        buildUidHelper.recordStageResult(stageName, 'SUCCESS')
-    } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
-        buildUidHelper.recordStageResult(stageName, 'ABORTED')
-        throw e
-    } catch (Exception e) {
-        String result = currentBuild.result ?: 'FAILURE'
-        buildUidHelper.recordStageResult(stageName, result)
-        throw e
+    int timeoutMins = getStageTimeout(stageName)
+    Closure trackedBody = {
+        try {
+            body()
+            buildUidHelper.recordStageResult(stageName, 'SUCCESS')
+        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+            buildUidHelper.recordStageResult(stageName, 'ABORTED')
+            throw e
+        } catch (Exception e) {
+            String result = currentBuild.result ?: 'FAILURE'
+            buildUidHelper.recordStageResult(stageName, result)
+            throw e
+        }
+    }
+
+    if (timeoutMins > 0) {
+        echo "Enforcing stage timeout for '${stageName}': ${timeoutMins} minute(s)"
+        timeout(time: timeoutMins, unit: 'MINUTES') {
+            trackedBody()
+        }
+    } else {
+        trackedBody()
     }
 }
 
@@ -62,7 +88,7 @@ void executeStageWithTracking(String stageName, Closure body) {
  * Returns the parsed pipeline-config.json for non-Initialize stages,
  * or an empty map for the Initialize stage.
  */
-Map initializeStage(String stageName, List<String> prerequisites = [], String artifactFilter = 'pipeline-config.json') {
+Map initializeStage(String stageName, List<String> prerequisites = [], String artifactFilter = null) {
     echo "=== ${stageName} ==="
 
     // Pre-cleanup: Always clean workspace for restartability
@@ -78,7 +104,8 @@ Map initializeStage(String stageName, List<String> prerequisites = [], String ar
                 $class: 'GitSCM',
                 branches: [[name: "*/${params.CONFIG_REPO_BRANCH}"]],
                 userRemoteConfigs: [[
-                    url: params.CONFIG_REPO_URL
+                    url: params.CONFIG_REPO_URL,
+                    credentialsId: params.CONFIG_REPO_CREDENTIALS_ID ?: ''
                 ]],
                 extensions: [
                     [$class: 'SparseCheckoutPaths',
@@ -87,11 +114,16 @@ Map initializeStage(String stageName, List<String> prerequisites = [], String ar
                          [path: 'vendor-scripts/*'],
                          [path: 'vendor_stage_params.json'],
                          [path: 'adoptium_pipeline_config.json'],
-                         [path: 'jenkins_job_config.json']
+                         [path: 'jenkins_job_config.json'],
+                         [path: 'jenkins_credential_config.json']
                      ]]
                 ]
             ])
         }
+        // CONFIG_REPO_ROOT is the path to the checked-out config repository.
+        // Set for all CIs (Jenkins + local runner) so vendor scripts can locate
+        // vendor-constants.properties and vendor-scripts/ at a stable path.
+        env.CONFIG_REPO_ROOT = "${env.WORKSPACE}/config-repo"
     }
 
     // Lazy-load BuildUidHelper (only once, persists across stages via the field)
@@ -104,12 +136,23 @@ Map initializeStage(String stageName, List<String> prerequisites = [], String ar
     buildUidHelper.initializeBuildContext(stageName)
 
     // Validate prerequisites (skip for Initialize stage)
-    if (stageName != '01-initialize') {
+    if (stageName != '010-initialize') {
         buildUidHelper.validatePrerequisites(stageName, prerequisites)
     }
 
     // Retrieve artifacts into WORKSPACE root (skip for Initialize stage)
-    if (artifactFilter && stageName != '01-initialize') {
+    if (stageName != '010-initialize') {
+        // Resolve artifactFilter: combine pipeline-config.json with stage's stageInputArtifacts.
+        // Patterns are relative to the Jenkins artifact store root (i.e. relative to TARGET_DIR
+        // of the producing stage) — no subfolder prefix is applied.
+        String effectiveFilter = artifactFilter
+        if (!effectiveFilter) {
+            List inputArtifacts = _resolveInputArtifacts(stageName)
+            List filterParts = ['pipeline-config.json']
+            inputArtifacts.each { String pattern -> filterParts << pattern }
+            effectiveFilter = filterParts.join(',')
+        }
+
         // Use currentBuild.number rather than env.BUILD_NUMBER. On a
         // "Restart from Stage" Jenkins restores env vars from the prior build,
         // so env.BUILD_NUMBER holds the original build number. currentBuild.number
@@ -122,19 +165,19 @@ Map initializeStage(String stageName, List<String> prerequisites = [], String ar
             copyArtifacts(
                 projectName: env.JOB_NAME,
                 selector: specific(buildNumber),
-                filter: artifactFilter,
+                filter: effectiveFilter,
                 target: '.',
                 optional: false,
                 fingerprintArtifacts: true
             )
-            echo "✅ Successfully copied artifacts from build #${buildNumber}: ${artifactFilter}"
+            echo "✅ Successfully copied artifacts from build #${buildNumber}: ${effectiveFilter}"
         } catch (Exception e) {
-            error("Failed to copy artifacts '${artifactFilter}' from build #${buildNumber}: ${e.message}")
+            error("Failed to copy artifacts '${effectiveFilter}' from build #${buildNumber}: ${e.message}")
         }
     }
 
     // Return config for convenience (empty for Initialize stage)
-    if (stageName == '01-initialize') {
+    if (stageName == '010-initialize') {
         return [:]
     }
     env.INPUT_ARTIFACTS_DIR = "${env.WORKSPACE}"
@@ -143,6 +186,39 @@ Map initializeStage(String stageName, List<String> prerequisites = [], String ar
     Map config = readJSON(file: env.CONFIG_FILE)
     ensureBuildDescriptionSet(config)
     return config
+}
+
+/**
+ * Resolve stageInputArtifacts for a stage from collated-stage-params.json.
+ */
+@NonCPS
+private List _resolveInputArtifacts(String stageName) {
+    if (env.COLLATED_STAGE_INPUT_ARTIFACTS) {
+        try {
+            Map inputMap = new groovy.json.JsonSlurper().parseText(env.COLLATED_STAGE_INPUT_ARTIFACTS)
+            if (inputMap.containsKey(stageName)) {
+                List rawList = (List) inputMap[stageName]
+                return rawList.collect { String pat -> _substituteEnvVars(pat) }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+    return []
+}
+
+/**
+ * Expand ${VAR} and $VAR variable references from environment variables.
+ */
+@NonCPS
+private String _substituteEnvVars(String pattern) {
+    if (!pattern) { return pattern }
+    String result = pattern.replaceAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/) { _, name ->
+        env.getProperty(name) != null ? env.getProperty(name) : (env[name] != null ? env[name] : "\${${name}}")
+    }
+    result = result.replaceAll(/(?<!\\)\$([A-Za-z_][A-Za-z0-9_]*)/) { _, name ->
+        env.getProperty(name) != null ? env.getProperty(name) : (env[name] != null ? env[name] : "\$${name}")
+    }
+    return result
 }
 
 /**

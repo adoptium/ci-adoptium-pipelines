@@ -74,7 +74,7 @@ List collateAndMergeGroups() {
     // Load the canonical stage list so --orchestrated-stages is never duplicated here.
     def ps = load('ci/jenkins/lib/PipelineStages.groovy')
     sh(script: """\
-        python3 scripts/lib/collect-stage-params.py \\
+        scripts/lib/python-runner.sh scripts/lib/collect-stage-params.py \\
             --default-stages-dir scripts/stages \\
             --vendor-scripts-dir config-repo/vendor-scripts \\
             --orchestrated-stages ${ps.orchestratedStages()} \\
@@ -106,6 +106,25 @@ List collateAndMergeGroups() {
     List orderedGroups = mergedMap.values().toList()
     echo "✓ Collated ${rawGroups.size()} group(s) → ${orderedGroups.size()} merged group(s)"
     return orderedGroups
+}
+
+/**
+ * Re-clone the config repository into config-repo/ in the current workspace.
+ * Called at the start of any stage that runs on a worker node and needs
+ * config-repo/ present (the Fetch Configuration stage runs on a different
+ * node, so the directory is absent after each workspace-clean checkout).
+ */
+void checkoutConfigRepo() {
+    dir('config-repo') {
+        checkout([
+            $class: 'GitSCM',
+            branches: [[name: "*/${params.CONFIG_REPO_BRANCH}"]],
+            userRemoteConfigs: [[
+                url: params.CONFIG_REPO_URL,
+                credentialsId: params.CONFIG_REPO_CREDENTIALS_ID ?: ''
+            ]]
+        ])
+    }
 }
 
 /**
@@ -167,8 +186,10 @@ List buildForwardedParams(List orderedGroups, Map platformCfg) {
     // ── Config Repository separator ───────────────────────────────────────────
     fwd << [$class: 'jenkins.plugins.parameter_separator.ParameterSeparatorValue',
             name: '__sep_config_repo', sectionHeader: 'Config Repository']
-    fwd << string(name: 'CONFIG_REPO_URL',    value: params.CONFIG_REPO_URL    ?: '')
-    fwd << string(name: 'CONFIG_REPO_BRANCH', value: params.CONFIG_REPO_BRANCH ?: '')
+    fwd << string(name: 'CONFIG_REPO_URL',             value: params.CONFIG_REPO_URL             ?: '')
+    fwd << string(name: 'CONFIG_REPO_BRANCH',          value: params.CONFIG_REPO_BRANCH          ?: '')
+    fwd << string(name: 'CONFIG_REPO_CREDENTIALS_ID',  value: params.CONFIG_REPO_CREDENTIALS_ID  ?: '')
+    fwd << string(name: 'CONFIG_DEPLOYMENT_NAME',      value: params.CONFIG_DEPLOYMENT_NAME      ?: '')
     return fwd
 }
 
@@ -197,6 +218,9 @@ pipeline {
                     echo "Pipeline SHA: ${env.GIT_COMMIT} | Platforms: ${params.PLATFORMS}"
                 }
             }
+            post {
+                always { cleanWs() }
+            }
         }
 
         stage('Fetch Configuration') {
@@ -205,14 +229,33 @@ pipeline {
                 script {
                     String configFile = "configurations/jdk${env.JDK_VERSION}_pipeline_config.json"
                     dir('config-repo') {
-                        git url: params.CONFIG_REPO_URL, branch: params.CONFIG_REPO_BRANCH
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: "*/${params.CONFIG_REPO_BRANCH}"]],
+                            userRemoteConfigs: [[
+                                url: params.CONFIG_REPO_URL,
+                                credentialsId: params.CONFIG_REPO_CREDENTIALS_ID ?: ''
+                            ]]
+                        ])
                         if (!fileExists(configFile)) {
                             error("Configuration file not found: ${configFile}")
                         }
                         String configText = readFile(configFile)
-                        env.VERSION_CONFIG       = configText
-                        env.AVAILABLE_PLATFORMS  = new JsonSlurper()
-                            .parseText(configText).buildConfigurations.keySet().join(',')
+                        env.VERSION_CONFIG = configText
+                        Map parsedConfig   = new JsonSlurper().parseText(configText)
+                        // targetConfigurations (array) is the active subset of buildConfigurations.
+                        // Fall back to all keys only when targetConfigurations is absent (null).
+                        // An explicitly-empty list is intentionally left empty so the error below fires.
+                        List targetList = parsedConfig.targetConfigurations as List
+                        List allKeys    = parsedConfig.buildConfigurations?.keySet() as List ?: []
+                        List active     = (targetList != null)
+                            ? targetList.findAll { allKeys.contains(it) }
+                            : allKeys
+                        if (active.isEmpty()) {
+                            error("No active platforms found in ${configFile}: " +
+                                  "targetConfigurations is empty or none of its entries exist in buildConfigurations")
+                        }
+                        env.AVAILABLE_PLATFORMS = active.join(',')
                         echo "✓ Available platforms: ${env.AVAILABLE_PLATFORMS}"
                     }
                     // Populate CONFIG_STAGE_AGENT_LABELS from jenkins_job_config.json so
@@ -229,17 +272,26 @@ pipeline {
                             }
                         }
                         env.PIPELINE_TIMEOUT_HOURS = (jenkinsJobConfig?.pipelineTimeoutHours ?: 8).toString()
-                        // Capture the optional base folder so downstream stages can
-                        // build the correct job path when triggering platform builds.
-                        env.PIPELINE_BASE_FOLDER = ((jenkinsJobConfig?.pipelineBaseFolder ?: '') as String).trim().replaceAll(/\/+$/, '')
+                        // Derive the effective base folder from this job's own full path.
+                        // JOB_NAME is e.g. "andrew-pipeline-sandbox/beta/Build_openjdk_launchers/Build_openjdk21_launch"
+                        // Strip the trailing "Build_openjdk_launchers/<jobname>" to get the deployment folder.
+                        // This is authoritative — it works regardless of what pipelineBaseFolder says.
+                        String jobFolder = env.JOB_NAME
+                            .replaceAll(/\/Build_openjdk_launchers\/[^\/]+$/, '')
+                            .replaceAll(/\/+$/, '')
+                        // Only use jobFolder if it differs from the leaf job name (i.e. there is a real parent folder).
+                        env.PIPELINE_BASE_FOLDER = (jobFolder == env.JOB_NAME) ? '' : jobFolder
                         if (env.PIPELINE_BASE_FOLDER) {
-                            echo "✓ Pipeline base folder: ${env.PIPELINE_BASE_FOLDER}"
+                            echo "✓ Pipeline base folder (from JOB_NAME): ${env.PIPELINE_BASE_FOLDER}"
                         }
                     }
                     // Resolve worker label now that CONFIG_STAGE_AGENT_LABELS is populated.
                     env.WORKER_LABEL = getWorkerLabel()
                     echo "✓ Worker label resolved: ${env.WORKER_LABEL}"
                 }
+            }
+            post {
+                always { cleanWs() }
             }
         }
 
@@ -251,8 +303,12 @@ pipeline {
             }
             steps {
                 script {
+                    checkoutConfigRepo()
                     collateAndMergeGroups()
                 }
+            }
+            post {
+                always { cleanWs() }
             }
         }
 
@@ -275,6 +331,9 @@ pipeline {
                     echo "✓ Platforms: ${env.SELECTED_PLATFORMS}"
                 }
             }
+            post {
+                always { cleanWs() }
+            }
         }
 
         stage('Create/Update Platform Jobs') {
@@ -283,6 +342,7 @@ pipeline {
             }
             steps {
                 script {
+                    checkoutConfigRepo()
                     echo "Checking platform jobs against pipeline SHA: ${env.GIT_COMMIT}"
 
                     env.SELECTED_PLATFORMS.split(',').each { String platform ->
@@ -298,17 +358,25 @@ pipeline {
                             ignoreExisting:        false,
                             lookupStrategy:        'JENKINS_ROOT',
                             additionalParameters: [
-                                JDK_VERSION:          env.JDK_VERSION,
-                                PLATFORM:             platform,
-                                COLLATED_PARAMS_JSON: env.COLLATED_PARAMS_JSON,
-                                PIPELINE_COMMIT_SHA:  env.GIT_COMMIT,
-                                CONFIG_REPO_URL:      params.CONFIG_REPO_URL,
-                                CONFIG_REPO_BRANCH:   params.CONFIG_REPO_BRANCH
-                            ]
+                                    JDK_VERSION:                env.JDK_VERSION,
+                                    PLATFORM:                   platform,
+                                    COLLATED_PARAMS_JSON:        env.COLLATED_PARAMS_JSON,
+                                    PIPELINE_COMMIT_SHA:         env.GIT_COMMIT,
+                                    CONFIG_REPO_URL:             params.CONFIG_REPO_URL,
+                                    CONFIG_REPO_BRANCH:          params.CONFIG_REPO_BRANCH,
+                                    CONFIG_REPO_CREDENTIALS_ID:  params.CONFIG_REPO_CREDENTIALS_ID ?: '',
+                                    CONFIG_DEPLOYMENT_NAME:      params.CONFIG_DEPLOYMENT_NAME ?: '',
+                                    PIPELINE_BASE_FOLDER:        env.PIPELINE_BASE_FOLDER ?: '',
+                                    PIPELINES_REPO_URL:          params.PIPELINES_REPO_URL    ?: '',
+                                    PIPELINES_REPO_BRANCH:       params.PIPELINES_REPO_BRANCH ?: ''
+                                ]
                         )
                     }
                     echo '✓ Platform jobs created/updated'
                 }
+            }
+            post {
+                always { cleanWs() }
             }
         }
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 ################################################################################
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -139,7 +140,6 @@ def generate_adoptium_pipeline_config(
         "repository": {
             "url": "https://github.com/adoptium/ci-adoptium-pipelines.git",
             "branch": "main",
-            "credentialsId": "",
             "buildRepoUrl": "https://github.com/adoptium/temurin-build.git",
             "buildBranch": "master",
             "aqaRepoUrl": "https://github.com/adoptium/aqa-tests.git",
@@ -399,26 +399,26 @@ def migrate_additional_node_labels(platform_config: Dict[str, Any]) -> None:
 # Placeholders {os} and {arch} are resolved at runtime to sw.os.* / hw.arch.*
 # schema tokens by load-jenkins-json-config.py.
 _STAGE_AGENT_LABEL_DEFAULTS: Dict[str, str] = {
-    "01-initialize": "ci.role.worker",
-    "02-build": "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
-    "03-internal-code-sign": "eclipse-codesign",
-    "04-assemble-images": "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
-    "06-post-build-code-sign": "ci.role.worker",
-    "07-installer": "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
-    "08-code-sign-installer": "ci.role.worker",
-    "09-sbom-sign": "ci.role.worker",
-    "10-digital-artifact-sign": "ci.role.worker",
-    "11-verify-signing": "ci.role.worker",
-    "12-validate-sbom": "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
-    "13-smoke-tests": "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
-    "14-aqa-tests": "ci.role.build&&hw.arch.{arch}",
-    "15-tck-tests": "ci.role.build&&hw.arch.{arch}",
-    "16-publish": "ci.role.worker",
-    "20-reproducible-compare": "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
+    "010-initialize": "ci.role.worker",
+    "020-build": "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
+    "030-internal-code-sign": "eclipse-codesign",
+    "040-assemble-images": "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
+    "060-post-build-code-sign": "ci.role.worker",
+    "070-installer": "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
+    "080-code-sign-installer": "ci.role.worker",
+    "090-sbom-sign": "ci.role.worker",
+    "100-digital-artifact-sign": "ci.role.worker",
+    "110-verify-signing": "ci.role.worker",
+    "120-validate-sbom": "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
+    "130-smoke-tests": "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
+    "140-aqa-tests": "ci.role.build&&hw.arch.{arch}",
+    "150-tck-tests": "ci.role.build&&hw.arch.{arch}",
+    "190-publish": "ci.role.worker",
+    "200-reproducible-compare": "ci.role.build&&sw.os.{os}&&hw.arch.{arch}",
 }
 
 
-def generate_jenkins_job_config(pipeline_base_folder: str = "") -> Dict[str, Any]:
+def generate_jenkins_job_config() -> Dict[str, Any]:
     """Generate jenkins_job_config.json — Jenkins-specific configuration.
 
     stageAgentLabels keys are derived from scripts/stages/pipeline-stages.json
@@ -427,10 +427,10 @@ def generate_jenkins_job_config(pipeline_base_folder: str = "") -> Dict[str, Any
     expect.  Any stage present in the registry but absent from
     _STAGE_AGENT_LABEL_DEFAULTS receives 'ci.role.worker' as a safe default.
 
-    Args:
-        pipeline_base_folder: Optional Jenkins folder path under which all
-            generated jobs and views will be placed (e.g. "MyOrg/OpenJDK").
-            Empty string means Jenkins root (the default).
+    jobConfiguration is now per-deployment (not a top-level key).  The migration
+    tool emits a skeleton with a single "release" deployment so that the generated
+    file is immediately valid under the new schema.  Add further deployments
+    (e.g. "beta") manually after generation, each with its own jobConfiguration.
     """
     stages = load_pipeline_stages()
     stage_agent_labels: Dict[str, str] = {"__any__": "ci.role.worker"}
@@ -440,18 +440,9 @@ def generate_jenkins_job_config(pipeline_base_folder: str = "") -> Dict[str, Any
             stage_id, "ci.role.worker"
         )
 
-    config: Dict[str, Any] = {
-        "jenkinsfilePath": "ci/jenkins/Jenkinsfile.declarative",
-        "pipelineTimeoutHours": 8,
-        "activeNodeTimeoutMinutes": 10,
-    }
-
-    # Only emit pipelineBaseFolder when explicitly provided — omitting it is
-    # equivalent to the Jenkins root and avoids confusing blank fields.
-    if pipeline_base_folder:
-        config["pipelineBaseFolder"] = pipeline_base_folder
-
-    config["jobConfiguration"] = {
+    # Skeleton jobConfiguration placed inside the deployment entry.
+    # Copy and adjust per deployment before committing the generated file.
+    skeleton_job_configuration: Dict[str, Any] = {
         "defaultParameters": {
             "VARIANT": "temurin",
             "CLEAN_WORKSPACE_AFTER_STAGE": True,
@@ -461,6 +452,7 @@ def generate_jenkins_job_config(pipeline_base_folder: str = "") -> Dict[str, Any
             "SIGN_ARTIFACTS": True,
             "PUBLISH_ARTIFACTS": False,
             "RUN_REPRODUCIBLE_COMPARE": False,
+            "RELEASE_TYPE": "RELEASE",
         },
         "logRotation": {
             "daysToKeep": 30,
@@ -469,7 +461,20 @@ def generate_jenkins_job_config(pipeline_base_folder: str = "") -> Dict[str, Any
             "artifactNumToKeep": 10,
         },
     }
-    config["stageAgentLabels"] = stage_agent_labels
+
+    config: Dict[str, Any] = {
+        "jenkinsfilePath": "ci/jenkins/Jenkinsfile.declarative",
+        "pipelineTimeoutHours": 8,
+        "stageAgentLabels": stage_agent_labels,
+        "deployments": [
+            {
+                "name": "release",
+                "folder": "release",
+                "description": "Production release pipeline",
+                "jobConfiguration": skeleton_job_configuration,
+            }
+        ],
+    }
     return config
 
 
@@ -482,11 +487,6 @@ Examples:
   # Convert all configs and generate jenkins_job_config.json
   %(prog)s --source ../ci-jenkins-pipelines/pipelines/jobs/configurations \\
            --output ../ci-temurin-config
-
-  # Place all generated jobs inside a Jenkins folder
-  %(prog)s --source ../ci-jenkins-pipelines/pipelines/jobs/configurations \\
-           --output ../ci-temurin-config \\
-           --pipeline-base-folder MyOrg/OpenJDK
 
   # Dry run to preview
   %(prog)s --source ./configs --output ./output --dry-run
@@ -530,17 +530,6 @@ Examples:
         help="Overwrite existing JSON files without prompting",
     )
 
-    parser.add_argument(
-        "--pipeline-base-folder",
-        metavar="FOLDER",
-        default="",
-        help=(
-            "Jenkins folder path under which all generated jobs and views will "
-            "be placed (e.g. 'MyOrg/OpenJDK'). Written as pipelineBaseFolder in "
-            "jenkins_job_config.json. Omit to generate at the Jenkins root."
-        ),
-    )
-
     args = parser.parse_args()
 
     # Print header
@@ -566,8 +555,6 @@ Examples:
                 print(f"Would use converter: {converter}")
                 print(f"Source: {args.source}")
                 print(f"Output: {args.output}")
-                if args.pipeline_base_folder:
-                    print(f"Pipeline base folder: {args.pipeline_base_folder}")
                 print()
                 print("Process:")
                 print("1. Convert Groovy files to JSON (temp directory)")
@@ -721,17 +708,13 @@ Examples:
                 print()
                 print("Step 4: Generating jenkins_job_config.json...")
 
-                jenkins_config = generate_jenkins_job_config(
-                    pipeline_base_folder=args.pipeline_base_folder,
-                )
+                jenkins_config = generate_jenkins_job_config()
                 jenkins_config_file = args.output / "jenkins_job_config.json"
 
                 with open(jenkins_config_file, "w", encoding="utf-8") as f:
                     json.dump(jenkins_config, f, indent=2)
 
                 print(f"  Created: {jenkins_config_file.name}")
-                if args.pipeline_base_folder:
-                    print(f"  pipelineBaseFolder: {args.pipeline_base_folder}")
 
             # Print summary
             print()

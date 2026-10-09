@@ -24,18 +24,34 @@ When adding or modifying a stage, ensure all four artefacts are present and cons
 #   CONFIG_FILE         - Path to pipeline-config.json
 #   TARGET_DIR          - Where to write output artifacts
 #   INPUT_ARTIFACTS_DIR - Where to read input artifacts from (if needed)
+#   BUILD_OUTPUT_DIR    - Sub-directory name where 020-build places JDK binaries.
+#                         Read from stage-constants.properties via load-stage-constants.sh.
+#                         Downstream stages: read from ${INPUT_ARTIFACTS_DIR}/${BUILD_OUTPUT_DIR}
 #   BUILD_NUMBER        - Build identifier (optional, defaults to 'local')
+#
+# Optional Environment Variables
+#   PIPELINE_ROOT       - Root of the ci-adoptium-pipelines checkout.
+#                         Falls back to WORKSPACE when not set. Set
+#                         explicitly in CI environments where the pipeline
+#                         repo and WORKSPACE are in separate directories.
 #
 # Outputs
 #   ${TARGET_DIR}/**/*  - Stage output artifacts
 
 set -euo pipefail
 
-# Source shared utilities (paths relative to this script's location)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/../lib/logging-utils.sh"
-source "${SCRIPT_DIR}/../lib/config-utils.sh"
-source "${SCRIPT_DIR}/../lib/artifact-utils.sh"
+# ---------------------------------------------------------------------------
+# Resolve shared library utilities from ci-adoptium-pipelines.
+# PIPELINE_ROOT: set by CI pipelines where WORKSPACE is not the location of
+#   the ci-adoptium-pipelines repo. Falls back to WORKSPACE if not set.
+# ---------------------------------------------------------------------------
+PIPELINE_LIB="${PIPELINE_ROOT:-${WORKSPACE}}/scripts/lib"
+# shellcheck disable=SC1091
+source "${PIPELINE_LIB}/logging-utils.sh"
+# shellcheck disable=SC1091
+source "${PIPELINE_LIB}/config-utils.sh"
+# shellcheck disable=SC1091
+source "${PIPELINE_LIB}/artifact-utils.sh"
 
 STAGE_NAME="<stage-name>"
 BUILD_NUMBER="${BUILD_NUMBER:-local}"
@@ -85,7 +101,15 @@ Every stage that introduces new parameters or has runtime gate conditions needs 
 {
   "stageId": "NN-stem",
   "stageDisabled": false,
+  "stageTimeoutMinutes": 0,
   "stageCondition": [],
+  "stageInputArtifacts": [
+    "*.tar.gz",
+    "*.zip"
+  ],
+  "stageOutputArtifacts": [
+    "**/*"
+  ],
   "description": "Parameters consumed by the NN-stem stage.",
   "parameterGroups": [
     {
@@ -110,7 +134,7 @@ Every stage that introduces new parameters or has runtime gate conditions needs 
 
 ```json
 {
-  "stageId": "12-validate-sbom",
+  "stageId": "120-validate-sbom",
   "stageDisabled": false,
   "stageCondition": [
     { "param": "CREATE_SBOM", "value": true }
@@ -126,6 +150,7 @@ Every stage that introduces new parameters or has runtime gate conditions needs 
 | Rule | Reason |
 |---|---|
 | `set -euo pipefail` at the top | Any unhandled error exits immediately |
+| Set `PIPELINE_LIB="${PIPELINE_ROOT:-${WORKSPACE}}/scripts/lib"` and source from it | Works in core scripts, vendor overrides, and both Jenkins and local runner without any hardcoded path |
 | Source all three lib files | Ensures consistent logging and config access |
 | Call `validate_standard_environment` first | Fails fast if required vars are missing |
 | Read build config from `CONFIG_*` env vars | Pre-populated from `pipeline-config.json` by the orchestrator — no `jq` needed |
@@ -157,7 +182,21 @@ mkdir -p "${TARGET_DIR}"
 
 ## Vendor Override
 
-The `StageScriptRunner` checks `config-repo/vendor-scripts/<stem>.sh` before `scripts/stages/<stem>.sh`. A vendor script placed in the config repository replaces the default implementation entirely — it should follow the same interface contract so the surrounding Jenkins/local infrastructure continues to work.
+The `StageScriptRunner` resolves stage scripts in this order (first match wins):
+
+| Priority | Path | Runs on |
+|---|---|---|
+| 1 | `config-repo/vendor-scripts/<stem>.groovy` | Jenkins only |
+| 2 | `config-repo/vendor-scripts/<stem>.sh`     | Jenkins + local |
+| 3 | `config-repo/vendor-scripts/<stem>.py`     | Jenkins + local |
+| 4 | `scripts/stages/<stem>.groovy`             | Jenkins only |
+| 5 | `scripts/stages/<stem>.sh`                 | Jenkins + local |
+| 6 | `scripts/stages/<stem>.py`                 | Jenkins + local |
+| 7 | built-in no-op                             | Jenkins + local |
+
+`.groovy` scripts are Jenkins-only — the local runner silently skips them and continues to the next candidate. Multiple implementations can coexist: for example, a stage with both a `.groovy` and a `.sh` file will use the `.groovy` on Jenkins and the `.sh` locally, with no special configuration required.
+
+A vendor script placed in the config repository replaces the default implementation — it should follow the same interface contract so the surrounding Jenkins/local infrastructure continues to work.
 
 ## Adding the Stage to Jenkins
 
@@ -183,7 +222,6 @@ stage(NN_MY_STAGE) {
     steps {
         script {
             ensureLibsLoaded(NN_MY_STAGE)
-            nodeAgentHelper.waitForActiveNode(getStageLabel(NN_MY_STAGE), getActiveNodeTimeout())
             pipelineHelper.executeStageWithTracking(NN_MY_STAGE) {
                 def config = pipelineHelper.initializeStage(
                     NN_MY_STAGE,
@@ -249,4 +287,4 @@ if NN_MY_STAGE in self.stages_to_run and self._stage_condition_met(NN_MY_STAGE):
 - [`docs/STAGE_DEFINITION_REFERENCE.md`](./STAGE_DEFINITION_REFERENCE.md) — full schema reference, ownership rules, disable/enable guides
 - [`docs/CI_AGNOSTIC_ARCHITECTURE.md`](./CI_AGNOSTIC_ARCHITECTURE.md) — interface contract, per-stage summary, artifact flow
 - [`ci/jenkins/lib/StageScriptRunner.groovy`](../ci/jenkins/lib/StageScriptRunner.groovy) — vendor override resolution
-- [`scripts/lib/collect-stage-params.py`](../scripts/lib/collect-stage-params.py) — collation logic, `PRIORITY_GROUPS`, `stageCondition` validation
+- [`scripts/lib/collect-stage-params.py`](../scripts/lib/collect-stage-params.py) — collation logic, `stages`/`groups` output schema, `stageCondition` validation

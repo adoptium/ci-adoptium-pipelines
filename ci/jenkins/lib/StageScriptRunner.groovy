@@ -21,11 +21,11 @@ limitations under the License.
  * etc.) are called directly — no 'steps.' prefix, no init(this) delegation.
  *
  * Resolution order for run(stem):
- *   1. config-repo/vendor-scripts/<stem>.sh     ← vendor override (shell)
- *   2. config-repo/vendor-scripts/<stem>.groovy ← vendor override (Groovy)
+ *   1. config-repo/vendor-scripts/<stem>.groovy ← vendor override (Groovy)
+ *   2. config-repo/vendor-scripts/<stem>.sh     ← vendor override (shell)
  *   3. config-repo/vendor-scripts/<stem>.py     ← vendor override (Python)
- *   4. scripts/stages/<stem>.sh                 ← default (shell)
- *   5. scripts/stages/<stem>.groovy             ← default (Groovy)
+ *   4. scripts/stages/<stem>.groovy             ← default (Groovy)
+ *   5. scripts/stages/<stem>.sh                 ← default (shell)
  *   6. scripts/stages/<stem>.py                 ← default (Python)
  *   7. no-op → returns 0
  *
@@ -72,9 +72,12 @@ String containerEnvFlags() {
     // they arrive automatically via the STAGE_PARAM_NAMES dynamic block below.
     List vars = [
         'WORKSPACE',
+        'PIPELINE_ROOT',
+        'CONFIG_REPO_ROOT',
         'CONFIG_FILE',
         'TARGET_DIR',
         'INPUT_ARTIFACTS_DIR',
+        'BUILD_OUTPUT_DIR',
         'BUILD_NUMBER',
         'BUILD_UID',
         'GROUP_UID',
@@ -114,13 +117,45 @@ String containerEnvFlags() {
         .findAll { String name -> name }
     vars = vars + stageParamNames
 
+    // Forward credential env vars injected by CredentialHelper.withStageCredentials()
+    // via withCredentials().  STAGE_CREDENTIAL_ENV_VARS is set to the injected var
+    // *names* before withCredentials() is entered, and cleared in finally afterward,
+    // so it is always in sync with the active bindings.
+    // containerEnvFlags() is called from within _dispatch(), which runs inside the
+    // withCredentials() scope, so env.getProperty() resolves the live injected values.
+    // Jenkins masks those values in logs wherever they appear.
+    List credEnvVarNames = (env.getProperty('STAGE_CREDENTIAL_ENV_VARS') ?: '')
+        .split(',')
+        .collect { String name -> name.trim() }
+        .findAll { String name -> name }
+    vars = vars + credEnvVarNames
+
+    // Use shell variable expansion (${VAR}) rather than Groovy GString interpolation
+    // so that secret values are never baked into the Groovy string passed to sh().
+    // Jenkins only masks secrets that remain as environment variable references up
+    // until the shell receives them; once a secret is embedded in a Groovy string
+    // it is already "in the clear" in the CPS engine and the warning is raised.
     List flags = vars
         .unique()
         .findAll { String v -> env.getProperty(v) != null && env.getProperty(v) != '' }
-        .collect { String v -> "-e '${v}=${env.getProperty(v)}'" }
+        .collect { String v -> "-e \"${v}=\${${v}}\"" }
 
-    // Clear Jenkins agent-side askpass binaries that don't exist in the container.
-    flags << "-e 'GIT_ASKPASS='"
+    // GitHub token authentication — forward git-askpass.sh path if set by _withGitAuth().
+    // GITHUB_TOKEN itself is already forwarded above via the STAGE_CREDENTIAL_ENV_VARS block
+    // (withCredentials injects it into env and Jenkins masks it wherever it appears in logs).
+    // GIT_ASKPASS must be forwarded explicitly because it is set via withEnv() rather than
+    // withCredentials(), so it is not tracked in STAGE_CREDENTIAL_ENV_VARS.
+    String gitAskPass = env.getProperty('GIT_ASKPASS')
+    if (gitAskPass) {
+        // Override any host-side askpass entry already in the flags list.
+        flags.removeAll { String f -> f.startsWith('-e "GIT_ASKPASS=') }
+        // groovylint-disable-next-line GStringExpressionWithinString
+        flags << "-e 'GIT_ASKPASS=\${GIT_ASKPASS}'"
+    } else {
+        // No GitHub auth — clear any Jenkins agent-side askpass binary that does not
+        // exist inside the container.
+        flags << "-e 'GIT_ASKPASS='"
+    }
     flags << "-e 'SSH_ASKPASS='"
     flags << "-e 'GIT_TERMINAL_PROMPT=0'"
 
@@ -132,16 +167,101 @@ String containerEnvFlags() {
     // Set HOME to the Jenkins agent's home directory.  The host home is
     // bind-mounted into the container at the same path (by NodeAgentHelper),
     // so it is writable.  Without a valid HOME, git's temp-file allocation fails.
-    String jenkinsHome = env.getProperty('HOME') ?: '/home/jenkins'
-    flags << "-e 'HOME=${jenkinsHome}'"
+    // groovylint-disable-next-line GStringExpressionWithinString
+    flags << "-e 'HOME=\${HOME}'"
 
     return flags.join(' ')
 }
 
 /**
+ * Parse a properties file content string and return a Map<String,String>.
+ *
+ * Skips blank lines and lines whose first non-whitespace character is '#'.
+ * Lines must have the form KEY=VALUE; lines without '=' are skipped.
+ */
+@NonCPS
+private Map<String, String> _parsePropertiesContent(String content) {
+    Map<String, String> result = [:]
+    content.split('\n').each { String line ->
+        String trimmed = line.trim()
+        if (!trimmed || trimmed.startsWith('#')) { return }
+        int eq = trimmed.indexOf('=')
+        if (eq < 1) { return }
+        String key   = trimmed.substring(0, eq).trim()
+        String value = trimmed.substring(eq + 1).trim()
+        if (key) { result[key] = value }
+    }
+    return result
+}
+
+/**
+ * Read a .properties file and return a Map<String,String> of its entries.
+ *
+ * Returns an empty map if the file does not exist.
+ */
+private Map<String, String> _parseProperties(String path) {
+    if (!fileExists(path)) {
+        return [:]
+    }
+    return _parsePropertiesContent(readFile(path))
+}
+
+/**
+ * Load merged stage constants from core + optional vendor properties files.
+ *
+ * Reads scripts/stages/stage-constants.properties (core defaults) and, when
+ * config-repo/vendor-scripts/vendor-constants.properties exists, overlays
+ * vendor values on top.  Returns a Map<String,String> of all constants.
+ */
+Map<String, String> loadStageConstants() {
+    Map<String, String> constants = _parseProperties('scripts/stages/stage-constants.properties')
+    Map<String, String> vendor    = _parseProperties('config-repo/vendor-scripts/vendor-constants.properties')
+    constants.putAll(vendor)
+    return constants
+}
+
+/**
+ * Resolve the TARGET_DIR for a given stage stem.
+ *
+ * Always derived from the current WORKSPACE so it is valid on whichever agent
+ * the stage runs on — never a path from a prior stage on a different agent.
+ * The Jenkinsfile can call this to obtain the value for post-run archive blocks
+ * without duplicating the derivation logic.
+ *
+ * @param scriptStem  Stage stem e.g. '020-build'
+ * @return Absolute path: <WORKSPACE>/<scriptStem>-output
+ */
+String resolveTargetDir(String scriptStem) {
+    return "${env.WORKSPACE}/${scriptStem}-output"
+}
+
+/**
  * Resolve and execute a stage script, returning an exit code.
  *
- * @param scriptStem  Script stem e.g. '13-smoke-tests'
+ * @param scriptStem  Script stem e.g. '130-smoke-tests'
+ * @param config      Pipeline config map — forwarded to .groovy scripts as the call() argument.
+ *                    .sh and .py scripts receive config via environment variables.
+ * @return int exit code — 0 = success, non-zero = failure.
+ */
+// CredentialHelper instance — injected by Jenkinsfile.declarative after load().
+// Null when running without credential support (e.g. Restart from Stage where
+// Initialize was skipped); _withStageCredentials() falls back to body() directly.
+// credentialHelper is intentionally untyped (CPS script binding field).
+credentialHelper = null
+
+void setCredentialHelper(helper) {
+    credentialHelper = helper
+}
+
+/**
+ * Resolve and execute a stage script, returning an exit code.
+ *
+ * Wraps the dispatch in a credential scope via CredentialHelper.withStageCredentials()
+ * so vendor stage overrides receive any credentials declared in
+ * jenkins_credential_config.json without any change to call sites in
+ * Jenkinsfile.declarative.
+ *
+ * @param scriptStem  Script stem e.g. '130-smoke-tests'
  * @param config      Pipeline config map — forwarded to .groovy scripts as the call() argument.
  *                    .sh and .py scripts receive config via environment variables.
  * @return int exit code — 0 = success, non-zero = failure.
@@ -149,11 +269,11 @@ String containerEnvFlags() {
 int run(String scriptStem, Map config = null) {
     final int EXIT_SUCCESS = 0
     List candidates = [
-        [path: "config-repo/vendor-scripts/${scriptStem}.sh",     type: 'sh'],
         [path: "config-repo/vendor-scripts/${scriptStem}.groovy", type: 'groovy'],
+        [path: "config-repo/vendor-scripts/${scriptStem}.sh",     type: 'sh'],
         [path: "config-repo/vendor-scripts/${scriptStem}.py",     type: 'py'],
-        [path: "scripts/stages/${scriptStem}.sh",                 type: 'sh'],
         [path: "scripts/stages/${scriptStem}.groovy",             type: 'groovy'],
+        [path: "scripts/stages/${scriptStem}.sh",                 type: 'sh'],
         [path: "scripts/stages/${scriptStem}.py",                 type: 'py'],
     ]
 
@@ -166,6 +286,174 @@ int run(String scriptStem, Map config = null) {
 
     echo "▶ Running ${found.type.toUpperCase()} stage script: ${found.path}"
 
+    // Scope the stage input contract variables to this run() call via withEnv()
+    // so they are derived fresh from the current WORKSPACE on every invocation
+    // and never leak a stale value from a prior stage into the global env.
+    //
+    // TARGET_DIR           — stage output directory, always under the current WORKSPACE.
+    // CONFIG_FILE          — pipeline config written by initializeStage() to WORKSPACE root.
+    // INPUT_ARTIFACTS_DIR  — artifacts copied into WORKSPACE root by initializeStage().
+    //
+    // Stage constants (BUILD_OUTPUT_DIR etc.) are loaded from the .properties files
+    // and injected here so every script type (.sh, .py, .groovy) can read them
+    // without any per-script sourcing step.
+    //
+    // withEnv() is a scoped override: the values are visible to everything called
+    // within the closure (including _dispatch → sh → the stage script) but revert
+    // to their previous values when the closure returns.
+    String targetDir = resolveTargetDir(scriptStem)
+    String workspace = env.WORKSPACE
+
+    Map<String, String> stageConstants = loadStageConstants()
+    List<String> constantEnvEntries = stageConstants.collect { String k, String v -> "${k}=${v}" }
+
+    withEnv([
+        "TARGET_DIR=${targetDir}",
+        "CONFIG_FILE=${workspace}/pipeline-config.json",
+        "INPUT_ARTIFACTS_DIR=${workspace}",
+    ] + constantEnvEntries) {
+        int exitCode = EXIT_SUCCESS
+        _withStageCredentials(scriptStem) {
+            exitCode = _dispatch(found, config)
+        }
+
+        // Archive stage outputs from TARGET_DIR into the Jenkins artifact store.
+        if (fileExists(targetDir)) {
+            _archiveStageOutputs(scriptStem, targetDir)
+        }
+
+        return exitCode
+    }
+}
+
+/**
+ * Archive output artifacts from TARGET_DIR.
+ *
+ * stageOutputArtifacts patterns from <stem>.params.json are relative to
+ * TARGET_DIR — no subfolder indirection is applied.
+ */
+private void _archiveStageOutputs(String scriptStem, String targetDir) {
+    List outputPatterns = _resolveOutputArtifacts(scriptStem)
+    // null  → key absent → default ['**/*'] was applied inside _resolveOutputArtifacts().
+    // []    → stageOutputArtifacts explicitly empty → "archive nothing".
+    if (outputPatterns?.isEmpty()) {
+        return
+    }
+
+    dir(targetDir) {
+        outputPatterns.each { String pattern ->
+            archiveArtifacts artifacts: pattern,
+                             fingerprint: true,
+                             allowEmptyArchive: true
+        }
+    }
+}
+
+/**
+ * Resolve stageOutputArtifacts for a stage from collated-stage-params.json.
+ */
+@NonCPS
+private List _resolveOutputArtifacts(String scriptStem) {
+    if (env.COLLATED_STAGE_OUTPUT_ARTIFACTS) {
+        try {
+            Map outputMap = new groovy.json.JsonSlurper().parseText(env.COLLATED_STAGE_OUTPUT_ARTIFACTS)
+            if (outputMap.containsKey(scriptStem)) {
+                List rawList = (List) outputMap[scriptStem]
+                // Preserve an explicitly-empty list — it means "archive nothing".
+                return rawList.collect { String pat -> _substituteEnvVars(pat) }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+    // Key absent (or JSON unparseable): fall back to wildcard default.
+    return ['**/*']
+}
+
+/**
+ * Expand ${VAR} and $VAR variable references from environment variables.
+ */
+@NonCPS
+private String _substituteEnvVars(String pattern) {
+    if (!pattern) { return pattern }
+    String result = pattern.replaceAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/) { _, name ->
+        env.getProperty(name) != null ? env.getProperty(name) : (env[name] != null ? env[name] : "\${${name}}")
+    }
+    result = result.replaceAll(/(?<!\\)\$([A-Za-z_][A-Za-z0-9_]*)/) { _, name ->
+        env.getProperty(name) != null ? env.getProperty(name) : (env[name] != null ? env[name] : "\$${name}")
+    }
+    return result
+}
+
+/**
+ * Delegate to CredentialHelper.withStageCredentials() if available, otherwise
+ * call body() directly.  Provides graceful degradation when credentialHelper
+ * has not been injected (e.g. Restart from Stage skipping Initialize).
+ */
+private void _withStageCredentials(String stageId, Closure body) {
+    if (credentialHelper) {
+        credentialHelper.withStageCredentials(stageId, body)
+    } else {
+        body()
+    }
+}
+
+/**
+ * Write git-askpass.sh to the workspace and wrap body() in a withEnv() scope
+ * that sets GIT_ASKPASS to its path, when GITHUB_TOKEN is available.
+ *
+ * Why GIT_ASKPASS instead of embedding the token in a git config value:
+ *   GIT_ASKPASS is a *path* to a script — the token value never appears in any
+ *   withEnv() argument string.  The token stays in the GITHUB_TOKEN env var,
+ *   which withCredentials() already masks in Jenkins logs.  Embedding the token
+ *   in a GIT_CONFIG_VALUE_* or url.insteadOf string would place it in a variable
+ *   that Jenkins does not mask.
+ *
+ * git-askpass.sh content:  #!/bin/sh\necho "${GITHUB_TOKEN}"\n
+ * No secret literal — git calls it at auth time and it reads GITHUB_TOKEN from
+ * its inherited environment at that moment.
+ *
+ * git-askpass.sh is written to WORKSPACE and wiped by cleanWs() after every stage.
+ *
+ * Applies to all script types:
+ *   .sh/.py  — shell spawned by sh() inherits GIT_ASKPASS from withEnv scope.
+ *   .groovy  — every sh("git ...") call inside the loaded Groovy script also
+ *              inherits GIT_ASKPASS from this surrounding withEnv scope.
+ *
+ * If GITHUB_TOKEN is absent (vendor has not configured a GitHub PAT credential)
+ * body() is called directly with zero overhead.
+ */
+private void _withGitAuth(Closure body) {
+    String token = env.getProperty('GITHUB_TOKEN')
+    if (!token) {
+        body()
+        return
+    }
+
+    String askPassPath = "${env.WORKSPACE}/git-askpass.sh"
+    // groovylint-disable-next-line GStringExpressionWithinString
+    writeFile file: 'git-askpass.sh', text: '#!/bin/sh\necho "${GITHUB_TOKEN}"\n'
+    sh "chmod +x '${askPassPath}'"
+    echo '🔑 GitHub token present — git HTTPS operations will be authenticated via GIT_ASKPASS'
+
+    withEnv(["GIT_ASKPASS=${askPassPath}"]) {
+        body()
+    }
+}
+
+/**
+ * Dispatch a resolved stage script and return its exit code.
+ *
+ * Called from within the credential scope established by _withStageCredentials()
+ * so that containerEnvFlags() — invoked for container dispatch — sees the live
+ * withCredentials()-injected values via env.getProperty().
+ *
+ * Wrapped by _withGitAuth() so GIT_ASKPASS is active for all three script types:
+ *   .sh/.py  — shell inherits GIT_ASKPASS from the withEnv scope.
+ *   .groovy  — every sh("git ...") inside the loaded script inherits GIT_ASKPASS
+ *              from the enclosing withEnv scope transparently.
+ */
+private int _dispatch(Map found, Map config) {
+    final int EXIT_SUCCESS = 0
     String containerId = env.BUILD_CONTAINER_ID?.trim()
     String containerWs = env.BUILD_CONTAINER_WORKSPACE?.trim()
     String runtime     = env.BUILD_CONTAINER_RUNTIME?.trim() ?: 'docker'
@@ -181,37 +469,45 @@ int run(String scriptStem, Map config = null) {
         sh "mkdir -p '${env.TARGET_DIR}'"
     }
 
-    switch (found.type) {
-        case 'sh':
-            if (containerId) {
-                String eFlags = containerEnvFlags()
-                return sh(script: "${runtime} exec ${eFlags} -w '${containerWs}' '${containerId}' bash '${found.path}'", returnStatus: true)
-            }
-            return sh(script: "bash ${found.path}", returnStatus: true)
+    int exitCode = EXIT_SUCCESS
+    _withGitAuth {
+        switch (found.type) {
+            case 'sh':
+                if (containerId) {
+                    String eFlags = containerEnvFlags()
+                    exitCode = sh(script: "${runtime} exec ${eFlags} -w '${containerWs}' '${containerId}' bash '${found.path}'", returnStatus: true)
+                } else {
+                    exitCode = sh(script: "bash ${found.path}", returnStatus: true)
+                }
+                break
 
-        case 'groovy':
-            // Groovy scripts run on the host JVM (Jenkins CPS engine) and cannot
-            // be dispatched into the container automatically.  Any sh() calls
-            // inside such a script will run on the host, not in the container.
-            if (containerId) {
-                echo "⚠️  WARNING: Groovy stage script '${found.path}' is running on the host JVM " +
-                     "while the build agent is a container (BUILD_CONTAINER_ID=${containerId}). " +
-                     'Options: ' +
-                     '(1) Convert to a .sh or .py script — these are dispatched into the container automatically. ' +
-                     "(2) Issue '${runtime} exec' calls directly using BUILD_CONTAINER_ID and BUILD_CONTAINER_WORKSPACE."
-            }
-            def script = load(found.path)
-            return script(config) ?: EXIT_SUCCESS
+            case 'groovy':
+                // Groovy scripts run on the host JVM (Jenkins CPS engine) and cannot
+                // be dispatched into the container automatically.  Any sh() calls
+                // inside such a script will run on the host, not in the container.
+                if (containerId) {
+                    echo "⚠️  WARNING: Groovy stage script '${found.path}' is running on the host JVM " +
+                         "while the build agent is a container (BUILD_CONTAINER_ID=${containerId}). " +
+                         'Options: ' +
+                         '(1) Convert to a .sh or .py script — these are dispatched into the container automatically. ' +
+                         "(2) Issue '${runtime} exec' calls directly using BUILD_CONTAINER_ID and BUILD_CONTAINER_WORKSPACE."
+                }
+                def script = load(found.path)
+                exitCode = script(config) ?: EXIT_SUCCESS
+                break
 
-        case 'py':
-            // python-runner.sh resolves python3/python and execs the script.
-            if (containerId) {
-                String eFlags = containerEnvFlags()
-                return sh(script: "${runtime} exec ${eFlags} -w '${containerWs}' '${containerId}' scripts/lib/python-runner.sh '${found.path}'", returnStatus: true)
-            }
-            return sh(script: "scripts/lib/python-runner.sh '${found.path}'", returnStatus: true)
+            case 'py':
+                // python-runner.sh resolves python3/python and execs the script.
+                if (containerId) {
+                    String eFlags = containerEnvFlags()
+                    exitCode = sh(script: "${runtime} exec ${eFlags} -w '${containerWs}' '${containerId}' scripts/lib/python-runner.sh '${found.path}'", returnStatus: true)
+                } else {
+                    exitCode = sh(script: "scripts/lib/python-runner.sh '${found.path}'", returnStatus: true)
+                }
+                break
+        }
     }
-    return EXIT_SUCCESS
+    return exitCode
 }
 
 return this

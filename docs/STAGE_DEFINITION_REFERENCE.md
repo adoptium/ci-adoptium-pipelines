@@ -8,12 +8,30 @@ Every pipeline stage is defined by four artefacts that must all be consistent wi
 
 | Artefact | Location | Purpose |
 |---|---|---|
-| Shell script | `scripts/stages/NN-stem.sh` | Actual build/sign/test logic — CI-agnostic |
+| Stage script(s) | `scripts/stages/NN-stem.sh` (and/or `.py`, `.groovy`) | Actual build/sign/test logic — one or more script implementations; see resolution order below |
 | Params sidecar | `scripts/stages/NN-stem.params.json` | Stage metadata, gate conditions, and Jenkins/local parameters |
 | Declarative stage block | `ci/jenkins/Jenkinsfile.declarative` | Jenkins stage definition, agent, `when{}` conditions |
 | Local runner entry | `ci/local/run-pipeline.py` | `_stage_condition_met()` guard + `_run_stage()` call |
 
 A stage is only fully functional when all four artefacts are present and consistent.
+
+### Stage script resolution order
+
+Both `StageScriptRunner` (Jenkins) and `StageResolver` (local) walk the following candidate list and execute the **first file that exists**:
+
+| Priority | Path | Runs on |
+|---|---|---|
+| 1 | `config-repo/vendor-scripts/<stem>.groovy` | Jenkins only |
+| 2 | `config-repo/vendor-scripts/<stem>.sh`     | Jenkins + local |
+| 3 | `config-repo/vendor-scripts/<stem>.py`     | Jenkins + local |
+| 4 | `scripts/stages/<stem>.groovy`             | Jenkins only |
+| 5 | `scripts/stages/<stem>.sh`                 | Jenkins + local |
+| 6 | `scripts/stages/<stem>.py`                 | Jenkins + local |
+| 7 | built-in no-op                             | Jenkins + local |
+
+`.groovy` scripts are Jenkins-only — the local runner silently skips them and continues to the next candidate rather than treating the stage as a no-op.
+
+**Multiple implementations can coexist.** A stage can carry both a `.groovy` and a `.sh` file. Jenkins selects the `.groovy` (higher precedence) while the local runner falls through to the `.sh` automatically. This is the standard pattern when a stage requires Jenkins pipeline features (credential binding, `archiveArtifacts`, etc.) but also needs a local equivalent.
 
 ---
 
@@ -29,21 +47,22 @@ Stage scripts are prefixed with a two-digit number that defines their execution 
 
 | # | Stage | Script |
 |---|---|---|
-| 02 | Build | `02-build.sh` |
-| 03 | Internal Code Sign | `03-internal-code-sign.sh` |
-| 04 | Assemble Images | `04-assemble-images.sh` |
-| 06 | Post-Build Code Sign | `06-post-build-code-sign.sh` |
-| 07 | Build Installer | `07-installer.sh` |
-| 08 | Code Sign Installer | `08-code-sign-installer.sh` |
-| 09 | SBOM Sign | `09-sbom-sign.sh` |
-| 10 | Digital Artifact Sign | `10-digital-artifact-sign.sh` |
-| 11 | Verify Signing | `11-verify-signing.sh` |
-| 12 | Validate SBOM | `12-validate-sbom.sh` |
-| 13 | Smoke Tests | `13-smoke-tests.sh` |
-| 14 | AQA Tests | `14-aqa-tests.sh` |
-| 15 | TCK Tests | `15-tck-tests.sh` |
-| 16 | Publish Artifacts | `16-publish.sh` |
-| 20 | Reproducible Compare | `20-reproducible-compare.sh` |
+| 02 | Build | `020-build.sh` |
+| 03 | Internal Code Sign | `030-internal-code-sign.sh` |
+| 04 | Assemble Images | `040-assemble-images.sh` |
+| 06 | Post-Build Code Sign | `060-post-build-code-sign.sh` |
+| 07 | Build Installer | `070-installer.sh` |
+| 08 | Code Sign Installer | `080-code-sign-installer.sh` |
+| 09 | SBOM Sign | `090-sbom-sign.sh` |
+| 10 | Digital Artifact Sign | `100-digital-artifact-sign.sh` |
+| 11 | Verify Signing | `110-verify-signing.sh` |
+| 12 | Validate SBOM | `120-validate-sbom.sh` |
+| 13 | Smoke Tests | `130-smoke-tests.sh` |
+| 14 | AQA Tests | `140-aqa-tests.sh` |
+| 15 | TCK Tests | `150-tck-tests.sh` |
+| 18 | Create API Metadata | `180-create-api-metadata.sh` |
+| 19 | Publish Artifacts | `190-publish.sh` |
+| 20 | Reproducible Compare | `200-reproducible-compare.sh` |
 
 ---
 
@@ -55,8 +74,16 @@ Every `scripts/stages/NN-stem.params.json` file follows this schema:
 {
   "stageId": "NN-stem",
   "stageDisabled": false,
+  "stageTimeoutMinutes": 0,
   "stageCondition": [
     { "param": "PARAM_NAME", "value": true }
+  ],
+  "stageInputArtifacts": [
+    "*.tar.gz",
+    "*.zip"
+  ],
+  "stageOutputArtifacts": [
+    "**/*"
   ],
   "description": "Human-readable description of this file's purpose.",
   "parameterGroups": [
@@ -80,7 +107,7 @@ Every `scripts/stages/NN-stem.params.json` file follows this schema:
 
 #### `stageId` (string, required)
 
-Must exactly match the stem of this file (e.g. `"14-aqa-tests"` for `14-aqa-tests.params.json`). Used by the collator, Job DSL, and local runner to associate metadata with the correct stage.
+Must exactly match the stem of this file (e.g. `"140-aqa-tests"` for `140-aqa-tests.params.json`). Used by the collator, Job DSL, and local runner to associate metadata with the correct stage.
 
 #### `stageDisabled` (boolean, default `false`)
 
@@ -91,7 +118,7 @@ Controls whether this stage is active.
 
 **Convention:** any stage added to the core pipeline repository that is not intended for all vendors should ship with `"stageDisabled": true`. Vendors re-enable it by providing a `vendor-scripts/NN-stem.params.json` override with `"stageDisabled": false`.
 
-A vendor can also disable a core stage (e.g. `16-publish`) by supplying a `vendor-scripts/16-publish.params.json` with `"stageDisabled": true`.
+A vendor can also disable a core stage (e.g. `190-publish`) by supplying a `vendor-scripts/190-publish.params.json` with `"stageDisabled": true`.
 
 #### `stageCondition` (array, default `[]`)
 
@@ -109,7 +136,33 @@ A list of runtime conditions that must all be satisfied (AND) for the stage to e
 - If `stageDisabled: true`, the stage is always skipped regardless of conditions.
 - If `stageDisabled: false` but conditions are not met, the stage is skipped at runtime.
 
-**Gate-only files:** a `params.json` may contain only `stageId`, `stageDisabled`, and `stageCondition` with no `parameterGroups` (e.g. `08-code-sign-installer.params.json`). This is valid — it registers the gate condition without introducing any new parameters.
+**Gate-only files:** a `params.json` may contain only `stageId`, `stageDisabled`, `stageTimeoutMinutes`, and `stageCondition` with no `parameterGroups` (e.g. `080-code-sign-installer.params.json`). This is valid — it registers the gate condition without introducing any new parameters.
+
+#### `stageTimeoutMinutes` (integer, optional, default `0`)
+
+Optional wall-clock timeout in minutes for this stage.
+
+- `0` (or omitted) — no stage timeout is enforced; the stage is bounded only by the overall `pipelineTimeoutHours`.
+- `> 0` — `pipelineHelper.executeStageWithTracking()` wraps the stage execution in a Jenkins `timeout(time: N, unit: 'MINUTES')` block. If the stage exceeds this duration, it is aborted cleanly.
+
+#### `stageInputArtifacts` (array of strings, optional, default `[]`)
+
+A list of glob patterns declaring which artifacts this stage requires as inputs from the build artifact store (e.g. `["${BUILD_OUTPUT_DIR}/*sbom*.json"]`, `["${BUILD_OUTPUT_DIR}/*.tar.gz"]`, `["**/*"]`).
+
+- `pipeline-config.json` is always implicitly included at the artifact store root regardless of this list.
+- Supports variable substitution using `${VAR}` or `$VAR` syntax (e.g. `${BUILD_OUTPUT_DIR}`). Variables defined in `stage-constants.properties` / `vendor-constants.properties` or the environment are expanded during collation and at runtime.
+- In Jenkins, `PipelineHelper.initializeStage()` resolves these patterns from collated stage params and passes them to `copyArtifacts`.
+- In the local runner, `WorkspaceManager.restore_stage_inputs()` restores matching files from `build_artifacts/` into the stage workspace.
+- Patterns match files as they sit in the artifact store. Stages that need to read JDK binaries produced by `020-build` should use patterns like `${BUILD_OUTPUT_DIR}/*.tar.gz` or `${BUILD_OUTPUT_DIR}/*sbom*.json` so they target the `build_output/` sub-directory explicitly.
+
+#### `stageOutputArtifacts` (array of strings, optional, default `["**/*"]`)
+
+A list of glob patterns declaring which output artifacts created by this stage in `${TARGET_DIR}` should be archived into the build artifact store.
+
+- Supports variable substitution using `${VAR}` or `$VAR` syntax (e.g. `${BUILD_OUTPUT_DIR}`).
+- In Jenkins, `StageScriptRunner._archiveStageOutputs()` automatically archives the entire `TARGET_DIR` into the artifact store after the stage script finishes according to matching patterns.
+- In the local runner, `WorkspaceManager.archive_stage_outputs()` automatically copies matching files under `TARGET_DIR` into `build_artifacts/`.
+- The `020-build` stage writes its JDK binaries into `${TARGET_DIR}/${BUILD_OUTPUT_DIR}` (i.e. a `build_output/` sub-directory of `TARGET_DIR`). Downstream stages that need those binaries should look for them under `${INPUT_ARTIFACTS_DIR}/${BUILD_OUTPUT_DIR}`.
 
 #### `parameterGroups` (array, optional)
 
@@ -136,15 +189,17 @@ Each parameter:
 
 ## Parameter Ownership
 
-Each parameter name must be declared in **exactly one** stage's `params.json`. The collator enforces this and errors on duplicates across different group names.
+Each parameter name may be declared in one or more stage `params.json` files, subject to one rule: **all declarations must use the same group name**. The collator errors if a parameter appears under different group names in different stages.
 
-Other stages that need to gate on a parameter reference it via their `stageCondition` only — they do not re-declare it.
+The parameter is emitted once in the collated output (`groups[*].parameters`). The stage-level metadata (`stageCondition`, `stageDisabled`, `stageTimeoutMinutes`) is stored separately in `stages[*]`, one entry per non-disabled stage stem.
+
+Other stages that need to gate on the same parameter may re-declare it under the same group name (e.g. all signing stages re-declare `SIGN_ARTIFACTS` in `"Stage Selections"`) — this is the standard pattern for shared gate booleans.  Only the first description encountered (lowest stage number, default before vendor) is used; subsequent descriptions are silently ignored.
 
 ### Shared parameters across stages
 
-Some parameters (e.g. `BUILD_REF`, `AQA_REF`) are logically meaningful to more than one stage and may be re-declared in multiple `params.json` files — both default and vendor. The collator permits this **only when all declarations use the same group name**. The parameter is emitted once in the collated output.
+Some parameters (e.g. `BUILD_REF`, `AQA_REF`, `SIGN_ARTIFACTS`) are logically meaningful to more than one stage and may be re-declared in multiple `params.json` files — both default and vendor. The collator permits this **only when all declarations use the same group name**. The parameter is emitted once in the collated output.
 
-**Description precedence:** the description from the **first declaration encountered** (lowest stage number, default file before vendor file) is used. Descriptions from subsequent declarations are silently ignored. This keeps the displayed parameter description concise and avoids verbose concatenation.
+**Description precedence:** the description from the **first declaration encountered** (lowest stage number, default file before vendor file) is used. Descriptions from subsequent declarations are silently ignored.
 
 > When adding a shared parameter, write its canonical description in the lowest-numbered stage that declares it, since that will be the one shown to users.
 
@@ -152,12 +207,12 @@ Some parameters (e.g. `BUILD_REF`, `AQA_REF`) are logically meaningful to more t
 
 | Parameter | Owned by | Referenced via stageCondition by |
 |---|---|---|
-| `SIGN_ARTIFACTS` | `03-internal-code-sign` | `06`, `08`, `09`, `10`, `11` |
-| `ENABLE_INSTALLERS` | `07-installer` | `08` |
-| `RUN_TESTS` | `14-aqa-tests` | `13-smoke-tests` (via stem `14-aqa-tests`) |
-| `ENABLE_TCK` | `15-tck-tests` | — |
-| `PUBLISH_ARTIFACTS` | `16-publish` | — |
-| `RUN_REPRODUCIBLE_COMPARE` | `20-reproducible-compare` | — |
+| `SIGN_ARTIFACTS` | `030-internal-code-sign` | `06`, `08`, `09`, `10`, `11` |
+| `ENABLE_INSTALLERS` | `070-installer` | `08` |
+| `RUN_TESTS` | `140-aqa-tests` | `130-smoke-tests` (via stem `140-aqa-tests`) |
+| `ENABLE_TCK` | `150-tck-tests` | — |
+| `PUBLISH_ARTIFACTS` | `190-publish` | — |
+| `RUN_REPRODUCIBLE_COMPARE` | `200-reproducible-compare` | — |
 
 ---
 
@@ -170,6 +225,22 @@ Parameters from multiple stage files can share this group name — the collator 
 ---
 
 ## Vendor Override Rules
+
+A vendor supplies files in `config-repo/vendor-scripts/` to customise stages:
+
+### Script overrides
+
+Place a replacement script at `config-repo/vendor-scripts/NN-stem.<ext>`. The extension determines precedence and CI compatibility:
+
+| Extension | Precedence | Runs on |
+|---|---|---|
+| `.groovy` | Highest | Jenkins only |
+| `.sh`     | Middle  | Jenkins + local |
+| `.py`     | Lowest  | Jenkins + local |
+
+Multiple extensions can coexist in the same vendor-scripts directory — e.g. providing both `060-post-build-code-sign.groovy` (for Jenkins) and `060-post-build-code-sign.sh` (for local) is valid and intentional.
+
+### Params overrides
 
 A vendor supplies a `config-repo/vendor-scripts/NN-stem.params.json` to:
 
@@ -195,10 +266,12 @@ A vendor supplies a `config-repo/vendor-scripts/NN-stem.params.json` to:
 #
 # Required env: WORKSPACE, CONFIG_FILE, TARGET_DIR, INPUT_ARTIFACTS_DIR
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/../lib/logging-utils.sh"
-source "${SCRIPT_DIR}/../lib/config-utils.sh"
-source "${SCRIPT_DIR}/../lib/artifact-utils.sh"
+# PIPELINE_ROOT: set by CI pipelines where WORKSPACE is not the location of
+# the ci-adoptium-pipelines repo. Falls back to WORKSPACE if not set.
+PIPELINE_LIB="${PIPELINE_ROOT:-${WORKSPACE}}/scripts/lib"
+source "${PIPELINE_LIB}/logging-utils.sh"
+source "${PIPELINE_LIB}/config-utils.sh"
+source "${PIPELINE_LIB}/artifact-utils.sh"
 
 STAGE_NAME="new-stage"
 
@@ -222,6 +295,7 @@ main "$@"
 {
   "stageId": "NN-new-stage",
   "stageDisabled": false,
+  "stageTimeoutMinutes": 0,
   "stageCondition": [],
   "description": "Parameters for the new stage.",
   "parameterGroups": [
@@ -259,7 +333,6 @@ stage('New Stage') {
     steps {
         script {
             ensureLibsLoaded()
-            nodeAgentHelper.waitForActiveNode(getStageLabel('New Stage'), getActiveNodeTimeout())
             pipelineHelper.executeStageWithTracking('New Stage') {
                 def config = pipelineHelper.initializeStage(
                     'New Stage',
@@ -337,6 +410,6 @@ The stage will now appear in the Jenkins UI with its default parameters, and wil
 
 - [`docs/UNIVERSAL_STAGE_PATTERN.md`](./UNIVERSAL_STAGE_PATTERN.md) — shell script template and four-artefact checklist
 - [`docs/CI_AGNOSTIC_ARCHITECTURE.md`](./CI_AGNOSTIC_ARCHITECTURE.md) — three-layer architecture, per-stage summary, artifact flow
-- [`scripts/lib/collect-stage-params.py`](../scripts/lib/collect-stage-params.py) — collation logic, `PRIORITY_GROUPS`, `stageCondition` validation
+- [`scripts/lib/collect-stage-params.py`](../scripts/lib/collect-stage-params.py) — collation logic, `stages`/`groups` output schema, `stageCondition` validation
 - [`ci/jenkins/Jenkinsfile.declarative`](../ci/jenkins/Jenkinsfile.declarative) — `loadStageConditions()`, `stageConditionMet()`, stage `when{}` blocks
 - [`ci/local/run-pipeline.py`](../ci/local/run-pipeline.py) — `_stage_condition_met()`, `_load_stage_metadata()`

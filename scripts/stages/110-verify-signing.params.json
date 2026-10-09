@@ -1,0 +1,15 @@
+{
+  "stageId": "110-verify-signing",
+  "stageDisabled": false,
+  "stageTimeoutMinutes": 0,
+  "stageCondition": [
+    { "param": "SIGN_ARTIFACTS", "value": true }
+  ],
+  "stageInputArtifacts": [
+    "${BUILD_OUTPUT_DIR}/*"
+  ],
+  "stageOutputArtifacts": [
+    "verification-report.txt"
+  ],
+  "description": "Gate-only params.json for the verify-signing stage. Runs only when SIGN_ARTIFACTS is true."
+}

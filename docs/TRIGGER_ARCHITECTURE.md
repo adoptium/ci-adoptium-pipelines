@@ -1,0 +1,325 @@
+# Trigger Architecture
+
+This document describes the CI-agnostic trigger system that detects upstream
+OpenJDK tag events and automatically fires the appropriate build pipeline.
+
+---
+
+## Three-Layer Model
+
+```text
+Layer 0: Trigger Definitions (CI-agnostic JSON in config-repo)
+  trigger_config.json      — what versions to watch, patterns, repo URLs
+  jenkins_job_config.json  — deployments[], pipelineBaseFolder
+
+Layer 1b: CI Orchestration (Jenkins-specific)
+  Jenkinsfile.trigger      — scheduling, dedup policy, Jenkins API calls, build() trigger
+
+Layer 2: Trigger Scripts (CI-agnostic Bash)
+  scripts/triggers/        — pure detection logic; no Jenkins calls
+  config-repo/vendor-triggers/  — vendor overrides or additions
+```
+
+The Layer 2 scripts are locally executable and CI-agnostic. All Jenkins-specific
+logic (cron scheduling, build history queries, `build()` calls) lives exclusively
+in `Jenkinsfile.trigger`.
+
+---
+
+## Trigger Types
+
+### `detect-build-tag-for-github-release`
+
+Detects the latest upstream build tag matching `buildTagPattern` on `monitorRepo`,
+derives the expected published release tag using `publishNameMap` and
+`targetReleaseTagMap`, and checks whether it already exists on `targetRepo`
+(GitHub or GitHub Enterprise releases API).
+
+**Dedup policy:** guided by `"dedupBuildType": "NONE"` in the trigger result. The script itself checks `targetRepo` — if `shouldTrigger=true` the CI layer triggers directly. No Jenkins history check is needed.
+
+### `detect-ga-tag`
+
+Detects the latest upstream GA tag matching `gaTagPattern` on `monitorRepo`,
+resolves the build tag at the same commit SHA matching `buildTagPattern`.
+
+**Dedup policy:** guided by `"dedupBuildType": "NOT_ALREADY_BUILT"` in the trigger result. Handled entirely in `Jenkinsfile.trigger` — queries Jenkins build history for an existing completed or in-progress build with matching `SCM_REF`. `IN_PROGRESS` or `ALREADY_BUILT` → skip. `NOT_FOUND` → trigger. This covers the window between a completed private build and manual publish.
+
+### `weekly-head` (Moved to Vendor Triggers)
+
+No detection — unconditionally triggers a HEAD build on a weekly cron.
+**Dedup policy:** guided by `"dedupBuildType": "NONE"`. No dedup needed (idempotent by design).
+
+### Vendor types & Extensibility
+
+All trigger scripts (whether core or vendor-defined) are governed by the same unified `trigger-result.json` contract. This decouples the detection script from hardcoded CI pipeline logic, allowing vendors to easily specify their own custom trigger/dedup combinations.
+
+---
+
+## `trigger_config.json` Schema
+
+```json
+{
+  "triggers": [
+    {
+      "type": "<trigger-type-stem>",
+      "versions": [
+        {
+          "version":             "jdk21",
+          "monitorRepo":         "https://github.com/adoptium/jdk21u.git",
+          "targetRepo":          "https://github.com/adoptium/temurin21-binaries",
+          "buildTagPattern":     "jdk-21\\..+_adopt$",
+          "gaTagPattern":        "jdk-21\\..+-ga$",
+          "publishNameMap":      "s/_adopt$/-ea/",
+          "targetReleaseTagMap": "s/$/-beta/",
+          "suppressTestingConditions": [
+            {
+              "param": "RELEASE_TYPE",
+              "value": "WEEKLY",
+              "window": {
+                "event":      "OPENJDK_RELEASE_DAY",
+                "daysBefore": 0,
+                "daysAfter":  7
+              }
+            }
+          ],
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Field reference
+
+| Field | Used in | Required | Default when absent | Description |
+|---|---|---|---|---|
+| `monitorRepo` | all detect types | yes | — | Git repository URL to watch for tags |
+| `buildTagPattern` | `detect-build-tag-*`, `detect-ga-tag` | no | Version-derived (see below) | ERE regular expression to match/resolve the build tag |
+| `gaTagPattern` | `detect-ga-tag` | no | `.*-ga$` | ERE regular expression to match the GA tag |
+| `publishNameMap` | `detect-build-tag-*` | yes | — | `sed` expression: detected tag → publish name |
+| `targetReleaseTagMap` | `detect-build-tag-*` | yes | — | `sed` expression: publish name → release tag checked on `targetRepo` |
+| `targetRepo` | `detect-build-tag-*` | yes | — | GitHub/GHE releases repository to check for published assets |
+| `suppressTestingConditions` | all | no | `[]` (never suppress) | Conditions under which `RUN_TESTS` is forced false |
+| `enabled` | all | yes | — | Set `false` to disable this version without removing it |
+
+### `buildTagPattern` defaults
+
+When `buildTagPattern` is omitted, `trigger-utils.py default-build-tag-pattern` derives:
+
+- `jdk8` → `jdk8u.+_adopt$`
+- all others → `jdk-<N>[\\.+].+_adopt$`
+
+Explicitly setting `buildTagPattern` is always preferred — it removes the
+version-number-branching logic from the script and makes the pattern auditable.
+
+### `suppressTestingConditions`
+
+An array of conditions that must **all** match for `RUN_TESTS` to be forced
+`false` on the triggered launch job. Each condition:
+
+```json
+{
+  "param": "RELEASE_TYPE",   // parameter from effectiveParams (deployment defaults + RELEASE_TYPE)
+  "value": "WEEKLY",         // required value; supports "regex:" prefix
+  "window": {                // optional — condition only applies within this date window
+    "event":      "OPENJDK_RELEASE_DAY",
+    "daysBefore": 0,
+    "daysAfter":  7
+  }
+}
+```
+
+Built-in `event` names:
+
+| Name | Resolves to |
+|---|---|
+| `OPENJDK_RELEASE_DAY` | 3rd Tuesday of the current UTC month |
+
+If `window` is omitted, the condition applies unconditionally whenever the
+`param`/`value` match. If `window.event` is unrecognised, the condition is
+ignored and testing is **not** suppressed (fail safe).
+
+---
+
+## GROUP_UID for trigger-launched builds
+
+When a trigger fires the launch job it passes a **deterministic, human-readable
+`GROUP_UID`** that encodes the trigger source. Any downstream build job can
+therefore be traced back to exactly which trigger, version, and tag produced it
+without consulting Jenkins history.
+
+### Format
+
+```text
+trigger-<type-slug>-<version>-<scmRef-or-date>
+```
+
+| Segment | Source | Notes |
+|---|---|---|
+| `trigger` | Literal prefix | Distinguishes trigger-sourced IDs from manually-launched ones (which auto-generate `group-<timestamp>-<random>`) |
+| `<type-slug>` | `TRIGGER_TYPE` parameter with the leading `detect-` stripped | `ga-tag`, `build-tag`, `weekly-head`; other chars → `-` |
+| `<version>` | `versionConfig.version` | e.g. `jdk21`, `jdk8` |
+| `<scmRef-or-date>` | `triggerResult.scmRef` when non-empty; otherwise UTC `yyyyMMdd` of the trigger run | Non-alphanumeric chars in scmRef → `-` |
+
+### Examples
+
+| Trigger type | Version | scmRef | GROUP_UID produced |
+|---|---|---|---|
+| `detect-ga-tag` | `jdk21` | `jdk-21.0.13+7_adopt` | `trigger-ga-tag-jdk21-jdk-21.0.13+7_adopt` |
+| `detect-ga-tag` | `jdk8` | `jdk8u452-b09_adopt` | `trigger-ga-tag-jdk8-jdk8u452-b09_adopt` |
+| `detect-build-tag-for-github-release` | `jdk21` | `jdk-21.0.13+7_adopt` | `trigger-build-tag-jdk21-jdk-21.0.13+7_adopt` |
+| `detect-build-tag-for-github-release` | `jdk28` | `jdk-28+5_adopt` | `trigger-build-tag-jdk28-jdk-28+5_adopt` |
+| `weekly-head` | `jdk27` | *(empty — HEAD build)* | `trigger-weekly-head-jdk27-20250601` |
+| Manual launch | any | any | *(not supplied; launcher auto-generates `group-<timestamp>-<random>`)* |
+
+### Design properties
+
+- **Deterministic** — re-detecting the same tag produces the same GROUP_UID,
+  making the group trivially de-duplicatable without extra state.
+- **Human-readable** — the trigger source and JDK version are immediately
+  visible in any build sidebar or log.
+- **Date fallback for HEAD builds** — `weekly-head` has no scmRef (it builds
+  HEAD); the UTC date gives a stable, readable identifier per calendar day.
+- **No collision with manual launches** — manual launches that do not supply
+  `GROUP_UID` keep their random `group-<timestamp>-<random>` form and are
+  clearly distinguishable from trigger-sourced IDs.
+
+### Implementation
+
+`GROUP_UID` is constructed by `buildTriggerGroupId()` in
+[`ci/jenkins/Jenkinsfile.trigger`](../ci/jenkins/Jenkinsfile.trigger) and
+forwarded as the `GROUP_UID` parameter when `triggerLaunchJob()` calls
+`build()`. The launch job's `resolveGroupUid()` function (in
+[`ci/jenkins/Jenkinsfile.launch`](../ci/jenkins/Jenkinsfile.launch)) already
+honours a supplied `GROUP_UID` parameter, so no changes are required there.
+
+---
+
+## GitHub Enterprise Support
+
+The `check-github-release-asset` command in `trigger-utils.py` automatically
+detects whether `targetRepo` is github.com or GitHub Enterprise:
+
+- `https://github.com/org/repo` → `https://api.github.com/repos/org/repo/...`
+- `https://github.ibm.com/org/repo` → `https://github.ibm.com/api/v3/repos/org/repo/...`
+
+No extra configuration is needed — the URL hostname drives the API path.
+`GITHUB_TOKEN` is used for authentication on both variants.
+
+---
+
+## `vendor-triggers/` Extension Pattern
+
+Vendor trigger scripts follow the same resolution order as stage scripts:
+
+```text
+1. config-repo/vendor-triggers/<type>.sh   ← vendor override or addition
+2. scripts/triggers/<type>.sh              ← default (core pipeline repo)
+3. not found → error
+```
+
+### Adding a new trigger type
+
+1. Create `config-repo/vendor-triggers/<type>.sh` — implementing the unified `trigger-result.json` interface contract.
+2. Ensure the script writes the required fields to `trigger-result.json` (at `$TARGET_DIR`):
+
+   ```json
+   {
+     "shouldTrigger":   true|false,
+     "dedupBuildType":  "NONE"|"NOT_ALREADY_BUILT",
+     "scmRef":          "<optional SCM ref, branch, or tag; blank/empty implies HEAD>",
+     "publishName":     "<optional publish name override>",
+     "releaseType":     "<optional release type, e.g. NIGHTLY, WEEKLY, or RELEASE>"
+   }
+   ```
+
+3. Add a `{ "type": "<type>", "versions": [...] }` entry to `trigger_config.json`
+4. Add `"<type>"` to the relevant deployment's `triggers` array in `jenkins_job_config.json`
+5. Re-run the seed job — the trigger job is created automatically. No changes to the pipeline repository are required.
+
+### Example — Artifactory-backed build tag detection
+
+```json
+{
+  "type": "detect-build-tag-for-artifactory",
+  "versions": [
+    {
+      "version":         "jdk21",
+      "monitorRepo":     "https://github.ibm.com/runtimes/openj9-openjdk-jdk21.git",
+      "targetRepo":      "https://artifactory.example.com/openj9-binaries",
+      "buildTagPattern": "jdk-21\\..+_openj9-.+",
+      "publishNameMap":  "s/_openj9-/-/",
+      "targetReleaseTagMap": "s/$/-release/",
+      "enabled": true
+    }
+  ]
+}
+```
+
+The vendor script `config-repo/vendor-triggers/detect-build-tag-for-artifactory.sh`
+reads the same `monitorRepo`/`targetRepo`/`buildTagPattern`/`publishNameMap`/
+`targetReleaseTagMap` fields and queries Artifactory instead of GitHub releases.
+
+---
+
+## `TriggerScriptRunner` Reference
+
+```text
+ci/jenkins/lib/TriggerScriptRunner.groovy
+
+Resolution order:
+  1. config-repo/vendor-triggers/<type>.sh
+  2. scripts/triggers/<type>.sh
+  3. error (all types)
+
+Environment set for scripts:
+  WORKSPACE                   — Jenkins agent workspace
+  TARGET_DIR                  — <WORKSPACE>/trigger-<type>-output
+  TRIGGER_VERSION_CONFIG_FILE — <WORKSPACE>/trigger-version-config.json
+  PIPELINE_ROOT               — ci-adoptium-pipelines checkout root
+  GITHUB_TOKEN                — injected via withCredentials when configured
+
+Public API:
+  Map run(String triggerType, Map versionConfig)
+  boolean scriptExists(String triggerType)
+  void setGithubTokenCredentialId(String credId)
+```
+
+---
+
+## Deployment Folder Layout
+
+```text
+Jenkins root
+└── <pipelineBaseFolder>/           (from jenkins_job_config.json)
+    ├── <deployment.folder>/        e.g. "release"
+    │   ├── Build_openjdk_launchers/
+    │   │   └── Build_openjdk21_launch
+    │   ├── Build_openjdk/          (lazy-created at launch run time)
+    │   └── Triggers/
+    │       └── Trigger_detect-ga-tag   (daily cron — secured to release team)
+    └── <deployment.folder>/        e.g. "beta"
+        ├── Build_openjdk_launchers/
+        │   └── Build_openjdk21_launch
+        ├── Build_openjdk/
+        └── Triggers/
+            ├── Trigger_detect-build-tag-for-github-release  (daily cron)
+            └── Trigger_weekly-head                          (weekly cron)
+```
+
+Jenkins folder-level security is applied at the deployment folder boundary.
+The seed job creates these folders — operators apply security to them after
+the first seed run.
+
+---
+
+## Related Documentation
+
+- [`docs/JOB_DSL_AUTOMATION.md`](./JOB_DSL_AUTOMATION.md) — seed job setup and deployment model
+- [`docs/CI_AGNOSTIC_ARCHITECTURE.md`](./CI_AGNOSTIC_ARCHITECTURE.md) — three-layer pipeline architecture
+- [`scripts/lib/trigger-utils.py`](../scripts/lib/trigger-utils.py) — Python utility: GitHub API query, trigger-result.json writing
+- [`scripts/triggers/`](../scripts/triggers/) — default trigger scripts
+- [`ci/jenkins/lib/TriggerScriptRunner.groovy`](../ci/jenkins/lib/TriggerScriptRunner.groovy) — script resolution and execution
+- [`ci/jenkins/Jenkinsfile.trigger`](../ci/jenkins/Jenkinsfile.trigger) — Jenkins CI orchestration
+- [`ci/jenkins/job-dsl/seed/seed_job_dsl.groovy`](../ci/jenkins/job-dsl/seed/seed_job_dsl.groovy) — trigger job generation

@@ -1,0 +1,33 @@
+{
+  "stageId": "200-reproducible-compare",
+  "stageDisabled": false,
+  "stageTimeoutMinutes": 0,
+  "stageCondition": [
+    { "param": "RUN_REPRODUCIBLE_COMPARE", "value": true },
+    { "param": "SCM_REF", "value": "regex:.+" }
+  ],
+  "stageInputArtifacts": [
+    "${BUILD_OUTPUT_DIR}/*.tar.gz",
+    "${BUILD_OUTPUT_DIR}/*.zip"
+  ],
+  "stageOutputArtifacts": [
+    "comparison-report.txt",
+    "reprotest.diff",
+    "ReproduciblePercent"
+  ],
+  "description": "Parameters consumed by the reproducible build comparison stage.",
+  "parameterGroups": [
+    {
+      "name": "Stage Selections",
+      "description": "Boolean flags that control which pipeline stages are enabled. All stage-gate parameters are collected here so operators can see and adjust the full execution plan in one place.",
+      "parameters": [
+        {
+          "name": "RUN_REPRODUCIBLE_COMPARE",
+          "type": "boolean",
+          "default": false,
+          "description": "Run the reproducible build comparison stage. Requires SCM_REF to be set. Downloads the corresponding production Adoptium binary and diffs it against the locally produced build. Disabled by default."
+        }
+      ]
+    }
+  ]
+}

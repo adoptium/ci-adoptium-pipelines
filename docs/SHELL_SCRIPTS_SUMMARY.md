@@ -29,9 +29,9 @@ Environment validation and JSON config helpers.
 | `require_env VAR` | Exit 1 if `VAR` is unset or empty |
 | `require_file PATH` | Exit 1 if file does not exist |
 | `require_dir PATH` | Exit 1 if directory does not exist |
-| `load_config FILE` | `cat` the JSON file (requires `jq`) |
-| `get_config_value FILE JQ_PATH [DEFAULT]` | Extract string value via `jq`; exit 1 if absent and no default |
-| `get_config_bool FILE JQ_PATH [DEFAULT]` | Extract boolean value; returns `true`/`false` string |
+| `load_config FILE` | `cat` the JSON file |
+| `get_config_value FILE JSON_PATH [DEFAULT]` | Extract string value via `json-utils.py` (Python built-in `json`); exit 1 if absent and no default |
+| `get_config_bool FILE JSON_PATH [DEFAULT]` | Extract boolean value via `json-utils.py`; returns `true`/`false` string |
 | `validate_standard_environment` | Checks `WORKSPACE` and `CONFIG_FILE` are set and file exists; sets `TARGET_DIR` default to `${WORKSPACE}/target` if not already provided |
 
 ### [`scripts/lib/artifact-utils.sh`](../scripts/lib/artifact-utils.sh)
@@ -60,7 +60,7 @@ Required env vars: `CONFIG_FILE`, `WORKSPACE`, `CLEANUP_TYPE` (`"pre"` or `"post
 
 ### [`scripts/lib/build-metadata-writer.py`](../scripts/lib/build-metadata-writer.py)
 
-CLI script. Writes `build-metadata.json` from explicit arguments and a small set of `CONFIG_*` environment variables. Called by `02-build.sh` after a successful build.
+CLI script. Writes `build-metadata.json` from explicit arguments and a small set of `CONFIG_*` environment variables. Called by `020-build.sh` after a successful build.
 
 | Argument | Required | Description |
 |---|---|---|
@@ -73,16 +73,6 @@ CLI script. Writes `build-metadata.json` from explicit arguments and a small set
 | `--group-uid` | ☑️ | `GROUP_UID` value (optional) |
 
 Reads from env: `CONFIG_JAVA_TO_BUILD`, `CONFIG_TARGET_OS`, `CONFIG_ARCHITECTURE`, `CONFIG_VARIANT`.
-
-### [`scripts/lib/sbom-workspace-extractor.py`](../scripts/lib/sbom-workspace-extractor.py)
-
-CLI script. Reads an Adoptium SBOM JSON file and prints the `"Build Workspace Directory"` property value to stdout. Used by `02-build.sh` to derive the workspace path length needed for reproducible build path padding.
-
-```bash
-value=$(python3 sbom-workspace-extractor.py --sbom /path/to/sbom.json)
-```
-
-Exits 0 (prints empty line) when the property is absent; exits non-zero only on unreadable file or invalid JSON.
 
 ### [`scripts/lib/python-runner.sh`](../scripts/lib/python-runner.sh)
 
@@ -145,7 +135,7 @@ Stages are invoked by the pipeline runner via [`StageScriptRunner.groovy`](../ci
 
 ---
 
-### `02-build.sh` — Build JDK `REAL`
+### `020-build.sh` — Build JDK `REAL`
 
 Clones `temurin-build`, invokes `build-farm/make-adopt-build-farm.sh`, copies outputs to `TARGET_DIR`.
 
@@ -157,7 +147,7 @@ Key functions: `setup_build_environment`, `setup_temurin_build`, `setup_reproduc
 
 ---
 
-### `03-internal-code-sign.sh` — Internal Code Sign `STUB`
+### `030-internal-code-sign.sh` — Internal Code Sign `STUB`
 
 Code signs EXEs/DLLs and dylibs inside JDK 11+ JMODs, before image assembly. Must run on a dedicated signing node. Windows & Mac only; not applicable to jdk8.
 
@@ -166,25 +156,25 @@ Code signs EXEs/DLLs and dylibs inside JDK 11+ JMODs, before image assembly. Mus
 
 ---
 
-### `04-assemble-images.sh` — Assemble Images `STUB`
+### `040-assemble-images.sh` — Assemble Images `STUB`
 
-Runs the final OpenJDK `make images` processing to assemble signed JMODs into a complete JDK image. Must run after `03-internal-code-sign`. Windows & Mac only; not applicable to jdk8.
+Runs the final OpenJDK `make images` processing to assemble signed JMODs into a complete JDK image. Must run after `030-internal-code-sign`. Windows & Mac only; not applicable to jdk8.
 
 **Inputs:** `INPUT_ARTIFACTS_DIR` containing signed jmods
 **Outputs:** `TARGET_DIR` containing assembled JDK tarballs
 
 ---
 
-### `06-post-build-code-sign.sh` — Post-Build Code Sign `STUB`
+### `060-post-build-code-sign.sh` — Post-Build Code Sign `STUB`
 
-Code signs EXEs/DLLs and dylibs that were not signed in `03-internal-code-sign`. Covers all binaries for jdk8 (which has no internal signing stage), and the limited set of jdk11+ binaries outside of JMODs. Windows & Mac only.
+Code signs EXEs/DLLs and dylibs that were not signed in `030-internal-code-sign`. Covers all binaries for jdk8 (which has no internal signing stage), and the limited set of jdk11+ binaries outside of JMODs. Windows & Mac only.
 
 **Inputs:** `INPUT_ARTIFACTS_DIR` containing the assembled JDK image
 **Outputs:** `TARGET_DIR` containing code-signed output
 
 ---
 
-### `07-installer.sh` — Build Installers `STUB`
+### `070-installer.sh` — Build Installers `STUB`
 
 Creates platform-specific installers (`.msi`, `.pkg`, `.deb`, `.rpm`). Vendor-specific.
 
@@ -193,7 +183,7 @@ Creates platform-specific installers (`.msi`, `.pkg`, `.deb`, `.rpm`). Vendor-sp
 
 ---
 
-### `08-code-sign-installer.sh` — Code Sign Installer `STUB`
+### `080-code-sign-installer.sh` — Code Sign Installer `STUB`
 
 Code signs installer packages (`.msi` on Windows, `.pkg` on macOS). On macOS also submits to Apple for Notarization and staples the ticket. Windows & Mac only.
 
@@ -202,25 +192,25 @@ Code signs installer packages (`.msi` on Windows, `.pkg` on macOS). On macOS als
 
 ---
 
-### `09-sbom-sign.sh` — SBOM Sign `STUB`
+### `090-sbom-sign.sh` — SBOM Sign `STUB`
 
-JSF-signs the SBOM by embedding a JSON signature directly inside the SBOM document. Must run before `10-digital-artifact-sign` so the signed SBOM is included in GPG armoring. Only runs when the `CREATE_SBOM` stage parameter is true.
+JSF-signs the SBOM by embedding a JSON signature directly inside the SBOM document. Must run before `100-digital-artifact-sign` so the signed SBOM is included in GPG armoring. Only runs when the `CREATE_SBOM` stage parameter is true.
 
 **Inputs:** `INPUT_ARTIFACTS_DIR` containing SBOM JSON files
 **Outputs:** `TARGET_DIR` containing JSF-signed SBOM files
 
 ---
 
-### `10-digital-artifact-sign.sh` — Digital Artifact Sign `STUB`
+### `100-digital-artifact-sign.sh` — Digital Artifact Sign `STUB`
 
-Applies detached GPG signatures (`.sig` / `.asc`) to all build artifacts for public distribution verification. Covers code-signed JDK archives, installer packages, and JSF-signed SBOMs. Runs after `09-sbom-sign` so the signed SBOM is included in GPG armoring.
+Applies detached GPG signatures (`.sig` / `.asc`) to all build artifacts for public distribution verification. Covers code-signed JDK archives, installer packages, and JSF-signed SBOMs. Runs after `090-sbom-sign` so the signed SBOM is included in GPG armoring.
 
 **Inputs:** `INPUT_ARTIFACTS_DIR` containing signed artifacts and signed SBOMs
 **Outputs:** `TARGET_DIR` containing `.sig`/`.asc` signature files
 
 ---
 
-### `11-verify-signing.sh` — Verify Signing `STUB`
+### `110-verify-signing.sh` — Verify Signing `STUB`
 
 Verifies that all necessary signing has been completed: Windows/macOS executables are code-signed, installer packages are code-signed (and notarized on macOS), and detached GPG signatures are present for every distribution artifact.
 
@@ -229,18 +219,18 @@ Verifies that all necessary signing has been completed: Windows/macOS executable
 
 ---
 
-### `12-validate-sbom.sh` — Validate SBOM `STUB`
+### `120-validate-sbom.sh` — Validate SBOM `STUB`
 
 Validates SBOM files produced during Build. Vendor-specific (tooling and acceptance criteria vary). Only runs when the `CREATE_SBOM` stage parameter is true.
 
-The Temurin implementation clones `temurin-build` and invokes `tooling/validateSBOM.sh`. It lives in `ci-temurin-config/vendor-scripts/12-validate-sbom.sh`.
+The Temurin implementation clones `temurin-build` and invokes `tooling/validateSBOM.sh`. It lives in `ci-temurin-config/vendor-scripts/120-validate-sbom.sh`.
 
 **Inputs:** `INPUT_ARTIFACTS_DIR` containing `*sbom*.json`
 **Outputs:** `TARGET_DIR` containing validation results
 
 ---
 
-### `13-smoke-tests.sh` — Smoke Tests `REAL`
+### `130-smoke-tests.sh` — Smoke Tests `REAL`
 
 Extracts the built JDK into `WORKSPACE/jdk-test/` and runs four quick checks.
 
@@ -258,7 +248,7 @@ Key functions: `find_jdk_artifact`, `extract_jdk`, `run_smoke_tests`, `test_java
 
 ---
 
-### `14-aqa-tests.sh` — AQA Tests `STUB`
+### `140-aqa-tests.sh` — AQA Tests `STUB`
 
 Runs the full AQA test suite. Vendor-specific (AQA infrastructure required).
 
@@ -267,7 +257,7 @@ Runs the full AQA test suite. Vendor-specific (AQA infrastructure required).
 
 ---
 
-### `15-tck-tests.sh` — TCK Tests `STUB`
+### `150-tck-tests.sh` — TCK Tests `STUB`
 
 Runs the TCK (Technology Compatibility Kit). Vendor-specific. Skipped for `jdk8u/s390x/linux`.
 
@@ -276,7 +266,16 @@ Runs the TCK (Technology Compatibility Kit). Vendor-specific. Skipped for `jdk8u
 
 ---
 
-### `16-publish.sh` — Publish Artifacts `STUB`
+### `180-create-api-metadata.sh` — Create API Metadata
+
+Generates metadata JSON files and `.sha256.txt` checksum files for all build output artifacts in `BUILD_OUTPUT_DIR`. Used by the Adoptium API service to query and index GitHub release assets.
+
+**Inputs:** `INPUT_ARTIFACTS_DIR` containing `build-metadata.json` and build artifacts in `BUILD_OUTPUT_DIR`
+**Outputs:** `${TARGET_DIR}/${BUILD_OUTPUT_DIR}/*.json`, `${TARGET_DIR}/${BUILD_OUTPUT_DIR}/*-metadata.json`, `${TARGET_DIR}/${BUILD_OUTPUT_DIR}/*.sha256.txt`
+
+---
+
+### `190-publish.sh` — Publish Artifacts `STUB`
 
 Publishes artifacts to a release repository. Vendor-specific.
 
@@ -285,11 +284,11 @@ Publishes artifacts to a release repository. Vendor-specific.
 
 ---
 
-### `20-reproducible-compare.sh` — Reproducible Build Comparison `STUB`
+### `200-reproducible-compare.sh` — Reproducible Build Comparison `STUB`
 
 Compares a locally built JDK against the vendor's published production binary to verify bit-for-bit reproducibility. The comparison tooling and binary source are vendor-specific.
 
-The Temurin implementation downloads from `api.adoptium.net` and uses `temurin-build/tooling/reproducible/repro_compare.sh`. It lives in `ci-temurin-config/vendor-scripts/20-reproducible-compare.sh`.
+The Temurin implementation downloads from `api.adoptium.net` and uses `temurin-build/tooling/reproducible/repro_compare.sh`. It lives in `ci-temurin-config/vendor-scripts/200-reproducible-compare.sh`.
 
 **Inputs:** `INPUT_ARTIFACTS_DIR` containing built JDK tarballs
 **Outputs:** `${TARGET_DIR}/comparison-report.txt`, `reprotest.diff`, `ReproduciblePercent`
@@ -306,17 +305,23 @@ Any `STUB` stage (and any `REAL` stage) can be overridden by placing a replaceme
 ```text
 config-repo/
 └── vendor-scripts/
-    ├── 06-post-build-code-sign.sh    ← overrides scripts/stages/06-post-build-code-sign.sh
-    ├── 07-installer.sh               ← overrides scripts/stages/07-installer.sh
+    ├── 060-post-build-code-sign.sh    ← overrides scripts/stages/060-post-build-code-sign.sh
+    ├── 070-installer.sh               ← overrides scripts/stages/070-installer.sh
     └── ...
 ```
 
 Resolution order (first match wins):
 
-1. `config-repo/vendor-scripts/<stem>.sh`
-1. `config-repo/vendor-scripts/<stem>.py`
-1. `scripts/stages/<stem>.sh`
-1. `scripts/stages/<stem>.py`
+1. `config-repo/vendor-scripts/<stem>.groovy` — vendor override (Jenkins only)
+1. `config-repo/vendor-scripts/<stem>.sh`     — vendor override (shell)
+1. `config-repo/vendor-scripts/<stem>.py`     — vendor override (Python)
+1. `scripts/stages/<stem>.groovy`             — default (Jenkins only)
+1. `scripts/stages/<stem>.sh`                 — default (shell)
+1. `scripts/stages/<stem>.py`                 — default (Python)
 1. built-in no-op (logs skip, returns 0)
+
+`.groovy` scripts are Jenkins-only — they are silently skipped by the local runner, which continues to the next candidate (`.sh` or `.py`).
+
+**Multiple implementations can coexist.** A stage can have both a `.groovy` and a `.sh` file: Jenkins will use the `.groovy` implementation (higher precedence) while the local runner will automatically fall through to the `.sh`. This is the recommended pattern when a stage requires Jenkins-specific pipeline features (e.g. `archiveArtifacts`, credential binding) but also needs to run locally.
 
 See [`ci/jenkins/lib/StageScriptRunner.groovy`](../ci/jenkins/lib/StageScriptRunner.groovy) (Jenkins) and [`ci/local/lib/stage_resolver.py`](../ci/local/lib/stage_resolver.py) (local) for the implementation.
